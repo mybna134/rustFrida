@@ -37,7 +37,6 @@ volatile uint64_t g_managed_direct_hit_count = 0;
 /* Managed helper reentrancy guard.  Generated managed helpers enter this
  * guard before executing DSL code; ART routing checks it to bypass nested Java
  * calls made from inside the helper on the same thread. */
-static __thread uint32_t g_managed_reentry_guard_depth = 0;
 volatile uint32_t g_managed_reentry_guard_enabled = 1;
 volatile uint64_t g_managed_reentry_guard_enter = 0;
 volatile uint64_t g_managed_reentry_guard_bypass = 0;
@@ -52,6 +51,32 @@ static ManagedGuardSlot g_managed_guard_slots[MANAGED_GUARD_SLOTS] = {{0}};
 static volatile uint64_t g_managed_guard_active = 0;
 static uint64_t hook_current_tpidr_el0(void);
 static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* counter);
+
+/* The custom loader does not provide an ELF TLS runtime. Keep the small
+ * router context in fixed per-thread slots instead of emitting TLSDESC
+ * relocations that the in-process loader cannot resolve. */
+typedef struct {
+    volatile uint64_t thread;
+    HookContext context;
+} RouterContextSlot;
+static RouterContextSlot g_art_router_context_slots[MANAGED_GUARD_SLOTS] = {{0}};
+
+static HookContext* hook_router_context_for_current_thread(void) {
+    uint64_t thread = hook_current_tpidr_el0();
+    for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
+        if (__atomic_load_n(&g_art_router_context_slots[i].thread, __ATOMIC_ACQUIRE) == thread) {
+            return &g_art_router_context_slots[i].context;
+        }
+    }
+    for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
+        uint64_t expected = 0;
+        if (__atomic_compare_exchange_n(&g_art_router_context_slots[i].thread, &expected,
+                                        thread, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            return &g_art_router_context_slots[i].context;
+        }
+    }
+    return &g_art_router_context_slots[0].context;
+}
 
 /* Fast $orig bypass state */
 OrigBypassState g_orig_bypass[ORIG_BYPASS_SLOTS] = {{0}};
@@ -334,9 +359,6 @@ void hook_managed_reentry_guard_enter(void) {
     if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
         return;
     }
-    if (g_managed_reentry_guard_depth != UINT32_MAX) {
-        g_managed_reentry_guard_depth++;
-    }
     __atomic_add_fetch(&g_managed_reentry_guard_enter, 1, __ATOMIC_RELAXED);
 
     uint64_t thread = hook_current_tpidr_el0();
@@ -362,10 +384,6 @@ void hook_managed_reentry_guard_enter(void) {
 }
 
 void hook_managed_reentry_guard_leave(void) {
-    if (g_managed_reentry_guard_depth > 0) {
-        g_managed_reentry_guard_depth--;
-    }
-
     uint64_t thread = hook_current_tpidr_el0();
     for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
         ManagedGuardSlot* slot = &g_managed_guard_slots[i];
@@ -388,15 +406,27 @@ int hook_managed_reentry_guard_active(void) {
     if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
         return 0;
     }
-    if (g_managed_reentry_guard_depth == 0) {
-        return 0;
+    uint64_t thread = hook_current_tpidr_el0();
+    int active = 0;
+    for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
+        if (__atomic_load_n(&g_managed_guard_slots[i].thread, __ATOMIC_ACQUIRE) == thread) {
+            active = __atomic_load_n(&g_managed_guard_slots[i].depth, __ATOMIC_ACQUIRE) != 0;
+            break;
+        }
     }
+    if (!active) return 0;
     __atomic_add_fetch(&g_managed_reentry_guard_bypass, 1, __ATOMIC_RELAXED);
     return 1;
 }
 
 uint32_t hook_managed_reentry_guard_depth(void) {
-    return g_managed_reentry_guard_depth;
+    uint64_t thread = hook_current_tpidr_el0();
+    for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
+        if (__atomic_load_n(&g_managed_guard_slots[i].thread, __ATOMIC_ACQUIRE) == thread) {
+            return __atomic_load_n(&g_managed_guard_slots[i].depth, __ATOMIC_ACQUIRE);
+        }
+    }
+    return 0;
 }
 
 uint64_t hook_managed_reentry_guard_enters(void) {
@@ -661,11 +691,9 @@ volatile uint64_t g_fast_orig_active = 0;
 volatile uint64_t g_fast_orig_frame_thread = 0;
 volatile uint64_t g_fast_orig_frame_sp = 0;
 
-static __thread HookContext g_art_router_tls_ctx;
-
 static HookContext* art_router_prepare_quick_context(void* frame_sp, void* save_frame_sp) {
     uint8_t* sp = (uint8_t*)frame_sp;
-    HookContext* ctx = &g_art_router_tls_ctx;
+    HookContext* ctx = hook_router_context_for_current_thread();
     uint64_t thread = 0;
 #if defined(__aarch64__)
     __asm__ __volatile__("mov %0, x19" : "=r"(thread));

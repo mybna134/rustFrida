@@ -176,10 +176,13 @@ frida_bootstrap (FridaBootstrapContext * ctx)
   if (ctx->allocation_base == NULL)
   {
     ctx->allocation_base = mmap (NULL, ctx->allocation_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ctx->allocation_base != MAP_FAILED)
-      frida_prctl (0x53564d41 /* PR_SET_VMA */, 0 /* PR_SET_VMA_ANON_NAME */,
-                   (unsigned long) ctx->allocation_base, ctx->allocation_size,
-                   (unsigned long) "wwb_loader");
+    /*
+     * Do not name this mapping.  Some older Android kernel backports retain
+     * the userspace PR_SET_VMA_ANON_NAME pointer instead of copying the name.
+     * This string lives in the temporary code-swap image, so after that image
+     * is restored /proc/self/maps exposes freed bytes and may cease to be
+     * valid UTF-8.
+     */
     return (ctx->allocation_base == MAP_FAILED)
         ? FRIDA_BOOTSTRAP_ALLOCATION_ERROR
         : FRIDA_BOOTSTRAP_ALLOCATION_SUCCESS;

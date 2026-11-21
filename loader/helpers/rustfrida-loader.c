@@ -87,6 +87,15 @@
 #ifndef R_AARCH64_RELATIVE
 # define R_AARCH64_RELATIVE 1027
 #endif
+#ifndef DT_ANDROID_RELR
+# define DT_ANDROID_RELR 0x6fffe000
+#endif
+#ifndef DT_ANDROID_RELRSZ
+# define DT_ANDROID_RELRSZ 0x6fffe001
+#endif
+#ifndef DT_ANDROID_RELRENT
+# define DT_ANDROID_RELRENT 0x6fffe003
+#endif
 #ifndef STT_GNU_IFUNC
 # define STT_GNU_IFUNC 10
 #endif
@@ -1024,6 +1033,76 @@ rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, 
   return true;
 }
 
+/* Android's linker may pack local relative relocations in DT_ANDROID_RELR.
+ * The agent has no DT_RELR tag, but its GOT/data pointers still depend on
+ * this table being applied before any constructor or worker code runs. */
+static bool
+rustfrida_apply_android_relr (RustFridaLinkedModule * module,
+    const ElfW(Addr) * entries, size_t size, const FridaLibcApi * libc)
+{
+  const size_t word_bits = sizeof (ElfW(Addr)) * 8;
+  size_t count;
+  size_t i;
+  ElfW(Addr) offset = 0;
+  size_t applied = 0;
+
+  if (entries == NULL || size == 0)
+    return true;
+  if ((size % sizeof (ElfW(Addr))) != 0)
+  {
+    rustfrida_set_error (module, libc, "invalid Android RELR size");
+    return false;
+  }
+
+  count = size / sizeof (ElfW(Addr));
+  for (i = 0; i != count; i++)
+  {
+    ElfW(Addr) entry = entries[i];
+
+    if ((entry & 1) == 0)
+    {
+      ElfW(Addr) * target;
+
+      offset = entry;
+      target = (ElfW(Addr) *) (module->base + offset);
+      if ((ElfW(Addr)) target < module->load_start ||
+          (ElfW(Addr)) target + sizeof (ElfW(Addr)) > module->load_end)
+      {
+        rustfrida_set_error (module, libc, "Android RELR target out of range");
+        return false;
+      }
+      *target += module->base;
+      applied++;
+      offset += sizeof (ElfW(Addr));
+    }
+    else
+    {
+      size_t bit;
+
+      for (bit = 1; bit != word_bits; bit++)
+      {
+        if ((entry & ((ElfW(Addr)) 1 << bit)) != 0)
+        {
+          ElfW(Addr) * target = (ElfW(Addr) *) (module->base + offset);
+
+          if ((ElfW(Addr)) target < module->load_start ||
+              (ElfW(Addr)) target + sizeof (ElfW(Addr)) > module->load_end)
+          {
+            rustfrida_set_error (module, libc, "Android RELR bitmap target out of range");
+            return false;
+          }
+          *target += module->base;
+          applied++;
+        }
+        offset += sizeof (ElfW(Addr));
+      }
+    }
+  }
+
+  (void) applied;
+  return true;
+}
+
 static bool
 rustfrida_protect_relro (RustFridaLinkedModule * module, const FridaLibcApi * libc)
 {
@@ -1047,6 +1126,26 @@ rustfrida_protect_relro (RustFridaLinkedModule * module, const FridaLibcApi * li
   }
 
   return true;
+}
+
+/*
+ * DT_INIT_ARRAY/DT_FINI_ARRAY entries are not guaranteed to have a
+ * relocation record in a manually linked PIE/DSO.  Android's dynamic linker
+ * presents them as absolute runtime addresses, while the compact loader may
+ * still see the original image-relative virtual address (for example
+ * 0x337184 in libagent.so).  Normalize both forms before making an indirect
+ * call.
+ */
+static void *
+rustfrida_resolve_module_address (RustFridaLinkedModule * module, ElfW(Addr) value)
+{
+  if (value == 0)
+    return NULL;
+
+  if (value >= module->load_start && value < module->load_end)
+    return (void *) value;
+
+  return (void *) (module->base + value);
 }
 
 static void
@@ -1083,8 +1182,10 @@ rustfrida_call_init_functions (RustFridaLinkedModule * module)
   {
     for (i = 0; i != init_array_size / sizeof (init_array[0]); i++)
     {
-      if (init_array[i] != NULL)
-        init_array[i] ();
+      void (* init) (void) = rustfrida_resolve_module_address (
+          module, (ElfW(Addr)) init_array[i]);
+      if (init != NULL)
+        init ();
     }
   }
 
@@ -1127,7 +1228,8 @@ rustfrida_call_fini_functions (RustFridaLinkedModule * module)
     count = fini_array_size / sizeof (fini_array[0]);
     while (count != 0)
     {
-      void (* fini) (void) = fini_array[--count];
+      void (* fini) (void) = rustfrida_resolve_module_address (
+          module, (ElfW(Addr)) fini_array[--count]);
       if (fini != NULL)
         fini ();
     }
@@ -1208,6 +1310,9 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   size_t relasz = 0;
   ElfW(Rela) * jmprel = NULL;
   size_t pltrelsz = 0;
+  const ElfW(Addr) * android_relr = NULL;
+  size_t android_relrsz = 0;
+  size_t android_relrent = 0;
   ElfW(Dyn) * dyn;
   char agent_vma_name[80];
 
@@ -1275,7 +1380,12 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   }
 
   load_bias = (ElfW(Addr)) reservation - load_start;
-  rustfrida_set_vma_name ((ElfW(Addr)) reservation, load_size, agent_vma_name);
+  /*
+   * agent_vma_name is stack storage owned by this short-lived loader thread.
+   * Kernels that retain PR_SET_VMA_ANON_NAME pointers would later expose stale
+   * bytes through /proc/self/maps.  Leave the reservation unnamed; file-backed
+   * segments still retain their normal memfd path.
+   */
 
   for (i = 0; i != file_ehdr->e_phnum; i++)
   {
@@ -1386,6 +1496,15 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
           goto fail;
         }
         break;
+      case DT_ANDROID_RELR:
+        android_relr = (const ElfW(Addr) *) (module->base + dyn->d_un.d_ptr);
+        break;
+      case DT_ANDROID_RELRSZ:
+        android_relrsz = dyn->d_un.d_val;
+        break;
+      case DT_ANDROID_RELRENT:
+        android_relrent = dyn->d_un.d_val;
+        break;
       default:
         break;
     }
@@ -1397,6 +1516,14 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   if (jmprel != NULL && !rustfrida_apply_relocations (module, jmprel, pltrelsz, libc))
     goto fail;
   frida_send_log (diagfd, "link: plt rela applied", libc);
+
+  if (android_relr != NULL && android_relrsz != 0)
+  {
+    if (android_relrent != sizeof (ElfW(Addr)) ||
+        !rustfrida_apply_android_relr (module, android_relr, android_relrsz, libc))
+      goto fail;
+    frida_send_log (diagfd, "link: android relr applied", libc);
+  }
 
   if (!rustfrida_protect_relro (module, libc))
     goto fail;
@@ -1479,7 +1606,7 @@ frida_main (void * user_data)
   FridaUnloadPolicy unload_policy;
   int ctrlfd_for_peer, ctrlfd, agent_codefd, agent_ctrlfd;
 
-  frida_syscall_5 (__NR_prctl, PR_SET_NAME, (size_t) "wwb-loader", 0, 0, 0);
+  frida_syscall_5 (__NR_prctl, PR_SET_NAME, (size_t) "ld-worker", 0, 0, 0);
 
   frida_memset (&agent_module, 0, sizeof (agent_module));
   thread_id = frida_gettid ();
