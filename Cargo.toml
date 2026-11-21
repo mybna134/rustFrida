@@ -10,6 +10,7 @@ members = [
     "ldmonitor-common",
     "ldmonitor-ebpf",
     "qbdi",
+    "cooperative-lease",
     "quickjs-hook"
 ]
 # We miss our linux_no_std example from the default members since `cargo check`
