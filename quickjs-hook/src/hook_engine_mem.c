@@ -10,6 +10,98 @@
 
 /* --- Page permission helpers --- */
 
+/* Parse only the ASCII address prefix of one procfs maps record.
+ * Do not use sscanf here: this code can run on a raw-clone worker which does
+ * not own a normal bionic pthread/TLS object, and VMA names are arbitrary
+ * bytes. */
+static int hook_parse_maps_range(const char* line, size_t len,
+                                 uintptr_t* start_out, uintptr_t* end_out) {
+    uintptr_t start = 0, end = 0;
+    size_t i = 0;
+    int digits = 0;
+
+    while (i < len && line[i] != '-') {
+        unsigned int value;
+        char c = line[i++];
+        if (c >= '0' && c <= '9') value = (unsigned int)(c - '0');
+        else if (c >= 'a' && c <= 'f') value = (unsigned int)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') value = (unsigned int)(c - 'A' + 10);
+        else return 0;
+        if (start > (UINTPTR_MAX - value) / 16u) return 0;
+        start = start * 16u + value;
+        digits++;
+    }
+    if (!digits || i >= len || line[i++] != '-') return 0;
+
+    digits = 0;
+    while (i < len && line[i] != ' ' && line[i] != '\t') {
+        unsigned int value;
+        char c = line[i++];
+        if (c >= '0' && c <= '9') value = (unsigned int)(c - '0');
+        else if (c >= 'a' && c <= 'f') value = (unsigned int)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') value = (unsigned int)(c - 'A' + 10);
+        else return 0;
+        if (end > (UINTPTR_MAX - value) / 16u) return 0;
+        end = end * 16u + value;
+        digits++;
+    }
+    if (!digits || end <= start) return 0;
+
+    *start_out = start;
+    *end_out = end;
+    return 1;
+}
+
+#define HOOK_MAX_MAP_GAPS 64
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+    int64_t dist;
+} HookMapGap;
+
+static void hook_record_map_range(uintptr_t vma_start, uintptr_t vma_end,
+                                  uintptr_t search_lo, uintptr_t search_hi,
+                                  uintptr_t target_addr, size_t page_size,
+                                  size_t alloc_size, uintptr_t* prev_end,
+                                  HookMapGap* gaps, int* num_gaps) {
+    if (*prev_end > 0 && vma_start > *prev_end) {
+        uintptr_t gs = *prev_end;
+        uintptr_t ge = vma_start;
+
+        if (gs < search_hi && ge > search_lo) {
+            if (gs < search_lo) gs = search_lo;
+            if (ge > search_hi) ge = search_hi;
+            gs = (gs + page_size - 1) & ~(page_size - 1);
+            ge &= ~(page_size - 1);
+
+            if (ge > gs && ge - gs >= alloc_size) {
+                int64_t d;
+                if (target_addr >= gs && target_addr < ge) d = 0;
+                else if (target_addr < gs) d = (int64_t)(gs - target_addr);
+                else d = (int64_t)(target_addr - ge);
+
+                if (*num_gaps < HOOK_MAX_MAP_GAPS) {
+                    gaps[*num_gaps].start = gs;
+                    gaps[*num_gaps].end = ge;
+                    gaps[*num_gaps].dist = d;
+                    (*num_gaps)++;
+                } else {
+                    int farthest = 0;
+                    for (int k = 1; k < HOOK_MAX_MAP_GAPS; k++) {
+                        if (gaps[k].dist > gaps[farthest].dist) farthest = k;
+                    }
+                    if (d < gaps[farthest].dist) {
+                        gaps[farthest].start = gs;
+                        gaps[farthest].end = ge;
+                        gaps[farthest].dist = d;
+                    }
+                }
+            }
+        }
+    }
+    if (vma_end > *prev_end) *prev_end = vma_end;
+}
+
 /*
  * Check if the page containing addr has read permission.
  * Parses /proc/self/maps to find the VMA and check perms[0] == 'r'.
@@ -660,61 +752,59 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     uintptr_t search_hi = target_addr + (uintptr_t)max_range;
     if (search_hi < target_addr) search_hi = UINTPTR_MAX;
 
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) {
+    int maps_fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (maps_fd < 0) {
         hook_log("hook_mmap_near_range: failed to open /proc/self/maps");
         return MAP_FAILED;
     }
 
-    #define MAX_GAPS 64
-    struct { uintptr_t start; uintptr_t end; int64_t dist; } gaps[MAX_GAPS];
+    HookMapGap gaps[HOOK_MAX_MAP_GAPS];
     int num_gaps = 0;
 
-    char line[512];
     uintptr_t prev_end = 0;
+    size_t maps_bytes = 0;
+    size_t maps_lines = 0;
+    size_t maps_parsed = 0;
+    char read_buf[4096];
+    char line_prefix[96];
+    size_t line_len = 0;
 
-    while (fgets(line, sizeof(line), f)) {
-        uintptr_t vma_start = 0, vma_end = 0;
-        if (sscanf(line, "%lx-%lx", &vma_start, &vma_end) < 2) continue;
-
-        if (prev_end > 0 && vma_start > prev_end) {
-            uintptr_t gs = prev_end;
-            uintptr_t ge = vma_start;
-
-            if (gs < search_hi && ge > search_lo) {
-                if (gs < search_lo) gs = search_lo;
-                if (ge > search_hi) ge = search_hi;
-                gs = (gs + page_size - 1) & ~(page_size - 1);
-                ge = ge & ~(page_size - 1);
-
-                if (ge > gs && (ge - gs) >= alloc_size) {
-                    int64_t d;
-                    if (target_addr >= gs && target_addr < ge) d = 0;
-                    else if (target_addr < gs) d = (int64_t)(gs - target_addr);
-                    else d = (int64_t)(target_addr - ge);
-
-                    if (num_gaps < MAX_GAPS) {
-                        gaps[num_gaps].start = gs;
-                        gaps[num_gaps].end = ge;
-                        gaps[num_gaps].dist = d;
-                        num_gaps++;
-                    } else {
-                        int farthest = 0;
-                        for (int k = 1; k < MAX_GAPS; k++) {
-                            if (gaps[k].dist > gaps[farthest].dist) farthest = k;
-                        }
-                        if (d < gaps[farthest].dist) {
-                            gaps[farthest].start = gs;
-                            gaps[farthest].end = ge;
-                            gaps[farthest].dist = d;
-                        }
-                    }
+    /* Keep only the record prefix; paths/VMA names may be long or non-UTF-8. */
+    for (;;) {
+        ssize_t got = read(maps_fd, read_buf, sizeof(read_buf));
+        if (got <= 0) break;
+        maps_bytes += (size_t)got;
+        for (ssize_t i = 0; i < got; i++) {
+            char c = read_buf[i];
+            if (c == '\n') {
+                uintptr_t vma_start = 0, vma_end = 0;
+                maps_lines++;
+                if (hook_parse_maps_range(line_prefix, line_len, &vma_start, &vma_end)) {
+                    maps_parsed++;
+                    hook_record_map_range(vma_start, vma_end, search_lo, search_hi,
+                                          target_addr, page_size, alloc_size,
+                                          &prev_end, gaps, &num_gaps);
                 }
+                line_len = 0;
+            } else if (line_len < sizeof(line_prefix)) {
+                line_prefix[line_len++] = c;
             }
         }
-        prev_end = vma_end;
     }
-    fclose(f);
+    if (line_len != 0) {
+        uintptr_t vma_start = 0, vma_end = 0;
+        maps_lines++;
+        if (hook_parse_maps_range(line_prefix, line_len, &vma_start, &vma_end)) {
+            maps_parsed++;
+            hook_record_map_range(vma_start, vma_end, search_lo, search_hi,
+                                  target_addr, page_size, alloc_size,
+                                  &prev_end, gaps, &num_gaps);
+        }
+    }
+    close(maps_fd);
+
+    hook_log("hook_mmap_near_range: maps bytes=%zu lines=%zu parsed=%zu gaps=%d",
+             maps_bytes, maps_lines, maps_parsed, num_gaps);
 
     /* 按离 target 的距离排序，近的 gap 先扫 */
     for (int i = 1; i < num_gaps; i++) {
@@ -823,7 +913,6 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     hook_log("hook_mmap_near_range: all %d gaps exhausted for target %p (range=±%lld)",
              num_gaps, target, (long long)max_range);
     return MAP_FAILED;
-    #undef MAX_GAPS
 }
 
 /* 公共函数: 默认 ±4GB (ADRP range) 的 wrapper，保持 ABI 兼容 */

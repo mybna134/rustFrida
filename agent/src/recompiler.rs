@@ -31,7 +31,8 @@ const PAGE_SIZE: usize = 4096;
 const MAX_TRAMPOLINE_PAGES: usize = 16; // 远距 recomp 时需要更多跳板空间
 const TRAMPOLINE_PAGE_CANDIDATES: &[usize] = &[1, 2, 4, 8, MAX_TRAMPOLINE_PAGES];
 const MIN_HOOK_SLOT_BYTES: usize = 32;
-const RECOMP_NEAR_RANGE: i64 = 112 * 1024 * 1024; // Keep original-page fallback B within ARM64 imm26 range.
+const RECOMP_NEAR_RANGE: i64 = 112 * 1024 * 1024; // 快路径：贴近原始页（B imm26 兼容窗口）
+const RECOMP_FAR_RANGE: i64 = 4 * 1024 * 1024 * 1024; // 近窗 gap 耗尽后的回退窗口（full-jump 自动分级编码）
 
 static VMA_RECOMP_CODE: &[u8] = b"wwb_recomp_code\0";
 static VMA_RECOMP_TRAMP: &[u8] = b"wwb_recomp_tramp\0";
@@ -182,11 +183,7 @@ fn suspend_poll_entrypoint() -> u64 {
     SUSPEND_POLLS_ENTRYPOINT.load(std::sync::atomic::Ordering::Acquire)
 }
 
-fn page_permissions(page: usize) -> Option<(bool, bool)> {
-    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
-        return None;
-    };
-
+fn page_permissions_in(maps: &str, page: usize) -> Option<(bool, bool)> {
     for line in maps.lines() {
         let mut parts = line.split_whitespace();
         let Some(range) = parts.next() else { continue };
@@ -208,8 +205,24 @@ fn page_permissions(page: usize) -> Option<(bool, bool)> {
     None
 }
 
+fn page_permissions(page: usize) -> Result<Option<(bool, bool)>> {
+    // VMA names are arbitrary kernel byte strings.  An application can use
+    // PR_SET_VMA_ANON_NAME with bytes that are not valid UTF-8, so treating the
+    // entire proc file as a Rust String makes one unrelated VMA invalidate the
+    // complete mapping table.  Only the address and permission columns matter
+    // here and those are ASCII; decode the path portion lossily.
+    let bytes = fs::read("/proc/self/maps").map_err(|e| {
+        format!(
+            "read /proc/self/maps failed: {} (errno={:?})",
+            e,
+            e.raw_os_error()
+        )
+    })?;
+    Ok(page_permissions_in(&String::from_utf8_lossy(&bytes), page))
+}
+
 fn read_code_page(page: usize, buf: &mut [u8]) -> Result<()> {
-    match page_permissions(page) {
+    match page_permissions(page)? {
         Some((true, true)) => unsafe {
             ptr::copy_nonoverlapping(page as *const u8, buf.as_mut_ptr(), buf.len());
             Ok(())
@@ -232,6 +245,13 @@ fn read_code_page(page: usize, buf: &mut [u8]) -> Result<()> {
         Some((_, false)) => Err(format!("page 0x{:x} is not executable", page)),
         None => Err(format!("page 0x{:x} not found in /proc/self/maps", page)),
     }
+}
+
+/// ensure_and_translate 失败时把底层错误透传到 hook_log 通道。
+/// C 侧 g_recomp_translate 只拿到 0，错误细节在这里才可见，
+/// 否则只能看到 "[STEALTH 失效] recomp 翻译失败" 而无法定位。
+fn log_translate_failure(addr: usize, err: &str) {
+    log_msg(format!("[recompiler] translate 0x{:x} failed: {}", addr, err));
 }
 
 unsafe extern "C" fn translate_existing_for_recompile(orig_addr: u64, _user_data: *mut libc::c_void) -> u64 {
@@ -695,10 +715,21 @@ pub fn ensure_and_translate(addr: usize) -> Result<usize> {
     };
 
     if need_recomp {
-        recompile(addr, 0)?;
+        if let Err(e) = recompile(addr, 0) {
+            log_translate_failure(addr, &e);
+            return Err(e);
+        }
     }
 
-    translate_addr(addr)
+    let translated = match translate_addr(addr) {
+        Ok(v) => v,
+        Err(e) => {
+            log_translate_failure(addr, &e);
+            return Err(e);
+        }
+    };
+
+    Ok(translated)
 }
 
 /// 获取地址在重编译页中的对应地址
@@ -1312,22 +1343,57 @@ fn alloc_recomp_region(orig_base: usize, tramp_pages: usize) -> Result<(*mut u8,
     let total_size = PAGE_SIZE + tramp_pages * PAGE_SIZE;
     let tramp_cap = tramp_pages * PAGE_SIZE;
 
-    let recomp_ptr = unsafe { hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, RECOMP_NEAR_RANGE) };
-    if recomp_ptr == libc::MAP_FAILED || recomp_ptr.is_null() {
-        return Err(format!(
-            "mmap near recomp region for 0x{:x}: {}",
+    // 范围阶梯：先 ±112MB（贴近原始页），耗尽后扩到 ±4GB。
+    //
+    // 背景：长驻进程里 libart/框架库周边 ±112MB 窗口的可见 gap 会被
+    // pool/slot/recomp 区域逐个占满，还有部分 VMA 被 KPM 隐藏不可见，
+    // 此时 hook_mmap_near_range 报 "all 0 gaps exhausted"，oat_patch /
+    // gate hook 的 recomp 翻译整体失败（attach 场景 [STEALTH 失效]）。
+    //
+    // 扩到 ±4GB 是安全的：
+    //   - region 内部唯一无条件短跳转是 recomp 代码页 → 同 region slot
+    //     的 B imm26，offset ≈ region 大小（几～十几页），与 region
+    //     离原始页的距离无关；
+    //   - slot → thunk 的 full jump 由 hook_write_jump 自动分级编码
+    //     （B ±128MB → ADRP ±4GB → MOVZ+MOVK 任意距离）。
+    let mut last_err: Option<String> = None;
+    for &range in &[RECOMP_NEAR_RANGE, RECOMP_FAR_RANGE] {
+        let recomp_ptr =
+            unsafe { hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, range) };
+        if recomp_ptr != libc::MAP_FAILED && !recomp_ptr.is_null() {
+            return Ok((recomp_ptr as *mut u8, total_size, tramp_cap));
+        }
+        let os_err = Error::last_os_error();
+        log_msg(format!(
+            "[recompiler] alloc region 0x{:x} (±{:#x} bytes) failed: {} (errno={:?})",
             orig_base,
-            Error::last_os_error()
+            range,
+            os_err,
+            os_err.raw_os_error()
+        ));
+        last_err = Some(format!(
+            "mmap near recomp region (±{:#x}) for 0x{:x}: {}",
+            range, orig_base, os_err
         ));
     }
 
-    Ok((recomp_ptr as *mut u8, total_size, tramp_cap))
+    Err(last_err.unwrap_or_else(|| "mmap near recomp region failed".to_string()))
 }
 
 fn try_compile_temp(orig_base: usize, orig_code: &[u8], tramp_pages: usize) -> Result<TempRecomp> {
     let total_size = PAGE_SIZE + tramp_pages * PAGE_SIZE;
     let tramp_cap = tramp_pages * PAGE_SIZE;
-    let recomp_ptr = unsafe { hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, RECOMP_NEAR_RANGE) };
+    let recomp_ptr = unsafe {
+        let mut ok_ptr: *mut libc::c_void = libc::MAP_FAILED;
+        for &range in &[RECOMP_NEAR_RANGE, RECOMP_FAR_RANGE] {
+            let p = hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, range);
+            if p != libc::MAP_FAILED && !p.is_null() {
+                ok_ptr = p;
+                break;
+            }
+        }
+        ok_ptr
+    };
     if recomp_ptr == libc::MAP_FAILED || recomp_ptr.is_null() {
         return Err(format!("mmap near recomp region: {}", Error::last_os_error()));
     }
