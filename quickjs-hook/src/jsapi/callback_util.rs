@@ -8,11 +8,10 @@ use crate::jsapi::console::output_message;
 use crate::jsapi::ptr::get_native_pointer_addr;
 use crate::jsapi::util::JSCFn;
 use crate::value::JSValue;
-use crate::JSEngine;
+use crate::jsapi::console::output_verbose;
 use std::cell::UnsafeCell;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::MutexGuard;
 
 const JS_MAX_SAFE_INTEGER: u64 = 1u64 << 53;
 
@@ -157,20 +156,7 @@ pub(crate) unsafe fn hot_atoms() -> &'static HotAtoms {
     &*HOT_ATOMS.0.get()
 }
 
-pub(crate) enum JsEngineCallbackGuard {
-    Locked {
-        _guard: MutexGuard<'static, Option<JSEngine>>,
-    },
-    Reentrant,
-}
-
-impl Drop for JsEngineCallbackGuard {
-    fn drop(&mut self) {
-        if matches!(self, JsEngineCallbackGuard::Locked { .. }) {
-            crate::clear_js_engine_owner_current_thread();
-        }
-    }
-}
+pub(crate) type JsEngineCallbackGuard = crate::execution_gate::EngineScope;
 
 /// Acquire JS_ENGINE lock for a hook callback.
 ///
@@ -183,20 +169,9 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
     _context_name: &str,
     _target_id: u64,
 ) -> Option<JsEngineCallbackGuard> {
-    let current_thread = crate::current_thread_id_u64();
-
-    if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == current_thread {
-        ffi::qjs_update_stack_top(ctx);
-        return Some(JsEngineCallbackGuard::Reentrant);
-    }
-
-    let g = match crate::JS_ENGINE.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    crate::mark_js_engine_owner_current_thread();
+    let scope = JsEngineCallbackGuard::enter(Some(crate::JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS)).ok()?;
     ffi::qjs_update_stack_top(ctx);
-    Some(JsEngineCallbackGuard::Locked { _guard: g })
+    Some(scope)
 }
 
 /// Check for JS exception, extract message + stack, and output error.
@@ -209,7 +184,28 @@ pub(crate) unsafe fn handle_js_exception(ctx: *mut ffi::JSContext, result: ffi::
         return false;
     }
     let exc = ffi::JS_GetException(ctx);
-    let exc_val = JSValue(exc);
+    log_extracted_js_exception(ctx, exc, context_name);
+    ffi::qjs_free_value(ctx, exc);
+    true
+}
+
+/// Log an already-extracted exception value (via `JS_GetException`).
+///
+/// The value is NOT freed and the QuickJS pending exception is NOT touched:
+/// the caller keeps the value alive to hand it to `on_js_exception`, which may
+/// need the preserved identity (`__jthrowable`) of an original Java throw.
+pub(crate) unsafe fn log_extracted_js_exception(ctx: *mut ffi::JSContext, exc_raw: ffi::JSValue, context_name: &str) {
+    let exc_val = JSValue(exc_raw);
+
+    // engine 拒绝的透传副本(qjs_exception() 在无 pending 时的 undefined/null):
+    // 不是脚本错误,降级为单行 verbose,防止 spawn 高压期淹没日志。
+    if exc_val.is_undefined() || exc_val.is_null() {
+        output_verbose(&format!(
+            "[{}] engine-refusal passthrough (no JS value; see three-state ExternalOutcome)",
+            context_name
+        ));
+        return;
+    }
 
     // message: Error.prototype.message 或 fallback 到 exception 本身 toString
     let msg_prop = exc_val.get_property(ctx, "message");
@@ -239,8 +235,6 @@ pub(crate) unsafe fn handle_js_exception(ctx: *mut ffi::JSContext, result: ffi::
         Some(s) => output_message(&format!("[{} error] {}\n{}", context_name, msg, s.trim_end())),
         None => output_message(&format!("[{} error] {}", context_name, msg)),
     }
-    exc_val.free(ctx);
-    true
 }
 
 /// Initialize a Mutex<Option<HashMap>> registry if not already initialized (idempotent).
@@ -529,12 +523,14 @@ pub(crate) unsafe fn dup_callback_to_bytes(ctx: *mut ffi::JSContext, callback: f
 /// QuickJS interrupt handler 周期性调用此函数。通过 ExceptionCheck JNI 调用
 /// 触发 kNative→kRunnable→kNative 转换，让 ART 处理 pending suspend/checkpoint 请求。
 /// 解决 JS_Call 长时间 kNative → SuspendThreadByPeer 超时 → SIGABRT。
-pub(crate) static ART_CHECKPOINT_ENV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static ART_CHECKPOINT_ENV: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// QuickJS interrupt handler — 注册到 JS_SetInterruptHandler。
 /// QuickJS 每执行一定数量的操作码后调用一次（默认 ~255 条指令）。
 pub(crate) unsafe extern "C" fn art_interrupt_handler(_rt: *mut ffi::JSRuntime, _opaque: *mut std::ffi::c_void) -> i32 {
-    let env = ART_CHECKPOINT_ENV.load(std::sync::atomic::Ordering::Acquire);
+    let env = ART_CHECKPOINT_ENV.with(std::cell::Cell::get);
     if env != 0 {
         let env_ptr = env as *mut std::ffi::c_void;
         let vtable = *(env_ptr as *const *const usize);
@@ -556,7 +552,7 @@ pub(crate) unsafe fn invoke_hook_callback_common(
     target_id: u64,
     build_context: impl FnOnce(*mut ffi::JSContext) -> ffi::JSValue,
     handle_result: impl FnOnce(*mut ffi::JSContext, ffi::JSValue, ffi::JSValue),
-    on_js_exception: impl FnOnce(*mut ffi::JSContext, ffi::JSValue),
+    on_js_exception: impl FnOnce(*mut ffi::JSContext, ffi::JSValue, ffi::JSValue),
 ) -> bool {
     invoke_hook_callback_common_with_env(
         ctx_raw,
@@ -578,7 +574,7 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     jni_env: *mut std::ffi::c_void,
     build_context: impl FnOnce(*mut ffi::JSContext) -> ffi::JSValue,
     handle_result: impl FnOnce(*mut ffi::JSContext, ffi::JSValue, ffi::JSValue),
-    on_js_exception: impl FnOnce(*mut ffi::JSContext, ffi::JSValue),
+    on_js_exception: impl FnOnce(*mut ffi::JSContext, ffi::JSValue, ffi::JSValue),
 ) -> bool {
     let ctx = ctx_raw as *mut ffi::JSContext;
 
@@ -596,16 +592,25 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     // ART suspend 兼容: 设置 interrupt handler 的 JNIEnv（JS_Call 期间周期性
     // 调用 ExceptionCheck 做 kNative→kRunnable→kNative 转换，处理 ART suspend 请求，
     // 避免 SuspendThreadByPeer 超时 → SIGABRT）。
-    let prev_env = ART_CHECKPOINT_ENV.swap(jni_env as usize, std::sync::atomic::Ordering::Release);
+    let prev_env = ART_CHECKPOINT_ENV.with(|cell| cell.replace(jni_env as usize));
 
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback_dup, global, 1, &js_ctx as *const _ as *mut _);
 
-    ART_CHECKPOINT_ENV.store(prev_env, std::sync::atomic::Ordering::Release);
+    ART_CHECKPOINT_ENV.with(|cell| cell.set(prev_env));
 
-    let had_exception = handle_js_exception(ctx, result, context_name);
-    if had_exception {
-        on_js_exception(ctx, js_ctx);
+    // 异常值必须保持存活并传给 on_js_exception：携带 __jthrowable 的错误
+    // 需要在那里按原身份恢复 Java 异常（exactly-once），不能只做日志。
+    let extracted_exc: Option<ffi::JSValue> = if ffi::qjs_is_exception(result) != 0 {
+        let exc = ffi::JS_GetException(ctx);
+        log_extracted_js_exception(ctx, exc, context_name);
+        Some(exc)
+    } else {
+        None
+    };
+    if let Some(exc) = extracted_exc {
+        on_js_exception(ctx, js_ctx, exc);
+        ffi::qjs_free_value(ctx, exc);
     } else {
         handle_result(ctx, js_ctx, result);
     }
@@ -614,6 +619,8 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     ffi::qjs_free_value(ctx, result);
     ffi::qjs_free_value(ctx, global);
     ffi::qjs_free_value(ctx, callback_dup);
+    // 防串扰:本轮未被收尾消费的「已执行」标记一律丢弃,不得跨回调泄漏。
+    crate::execution_gate::clear_external_markers();
 
-    had_exception
+    extracted_exc.is_some()
 }

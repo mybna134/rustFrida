@@ -88,7 +88,7 @@ lazy_static! {
     static ref INSTR_SENDER: Sender<RawInstrMessage> = {
         let (sender, receiver) = bounded::<RawInstrMessage>(100000);
 
-        crate::raw_thread::spawn_detached(b"wwb-stalker\0", move || {
+        crate::raw_thread::spawn_detached(b"perf-worker\0", move || {
             let log_path = match OUTPUT_PATH.get() {
                 Some(base) => format!("{}/trace.pb", base),
                 None => {

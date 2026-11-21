@@ -226,6 +226,6 @@ impl Drop for JSContext {
     }
 }
 
-// Safety: JSContext is protected by Mutex in the global JS_ENGINE, ensuring single-threaded access
+// Safety: global JSContext access holds the execution gate lease.
 unsafe impl Send for JSContext {}
 unsafe impl Sync for JSContext {}

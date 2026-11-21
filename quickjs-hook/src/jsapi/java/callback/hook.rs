@@ -162,7 +162,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
 
     let _in_flight_guard = InFlightJavaHookGuard::enter();
     let _callback_scope = JavaHookCallbackScope::enter();
-    let _gate_guard = crate::jsapi::java::art_controller::CallbackGateGuard;
 
     // user_data is ArtMethod* address (used as registry key)
     let art_method_addr = user_data as u64;
@@ -331,7 +330,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 write_primitive_return_to_context(ctx_ptr, return_type, ret_u64);
             }
         },
-        // JS 抛异常透明递传: 调用 js_call_original 代替直接 invoke_original_jni。
+        // JS 抛异常透明递传: 优先恢复原方法抛出的 Java 异常身份（exactly-once，
+        // 由 original_call.rs 在 `$orig` 返回处保留为 __jthrowable —— Throw() 同一实例,
+        // 不重放业务方法）。其余 JS 纯错误仍走 js_call_original 重放兜底。
         //
         // 为什么不能直接 invoke_original_jni? API 36 上 JS 异常 unwind 后直接进 JNI 会触发:
         //   - "Failed to recognize implicit suspend check ... state=Native" (SIGABRT), 或
@@ -341,7 +342,39 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         // 则 537+ 次异常 + 完整 UI nav 稳定不崩。推测 Mutex acquire/release barrier
         // 或 QuickJS 属性读清掉了 JS 异常 unwind 留下的脏 CPU/thread state。
         // 详见 memory: js-exception-orig-detour.md
-        |ctx, js_ctx_val| {
+        |ctx, js_ctx_val, exc_raw| {
+            // 优先级 1:$orig 的 external 已执行且原方法抛出了 Java 异常 ——
+            // 按保留身份 Throw 回 JVM。严禁重放(See original_call.rs: Already Executed)。
+            let executed_throwable = crate::execution_gate::take_pending_executed_throwable();
+            if executed_throwable != 0
+                && jni_rethrow_captured_exception(hook_ctx_env, executed_throwable) {
+                result_was_set.set(true);
+                return;
+            }
+            // 优先级 2:external 已执行且值已写回 ABI 寄存器 ——
+            // Java 侧已拿到正确结果,本次回调视为完成,严禁重放。
+            if crate::execution_gate::take_external_executed() {
+                result_was_set.set(true);
+                return;
+            }
+            let preserved_throwable = {
+                let exc_val = JSValue(exc_raw);
+                let prop = exc_val.get_property(ctx, "__jthrowable");
+                let g = if prop.is_undefined() || prop.is_null() {
+                    0
+                } else {
+                    js_value_to_u64_or_zero(ctx, prop)
+                };
+                prop.free(ctx);
+                g
+            };
+            if preserved_throwable != 0 && jni_rethrow_captured_exception(hook_ctx_env, preserved_throwable) {
+                // 同一 throwable 已回到 pending 链上；重编译入口按异常路径 unwind,
+                // 调用方拿到的就是原方法抛出的那个异常实例。
+                result_was_set.set(true);
+                return;
+            }
+            // 纯 JS 错误（原方法未被调时仍有正确语义）| Throw 失败 → 原有重放兜底。
             let result = js_call_original(ctx, js_ctx_val, 0, std::ptr::null_mut());
             if return_type != b'V' {
                 let ret_u64 = js_result_to_raw(ctx, JSValue(result), return_type);
@@ -412,7 +445,6 @@ pub(super) unsafe extern "C" fn java_critical_native_hook_callback(
 
     let _in_flight_guard = InFlightJavaHookGuard::enter();
     let _callback_scope = JavaHookCallbackScope::enter();
-    let _gate_guard = crate::jsapi::java::art_controller::CallbackGateGuard;
 
     let art_method_addr = user_data as u64;
     let (
@@ -495,7 +527,7 @@ pub(super) unsafe extern "C" fn java_critical_native_hook_callback(
                 write_primitive_return_to_context(ctx_ptr, return_type, ret_u64);
             }
         },
-        |ctx, js_ctx_val| {
+        |ctx, js_ctx_val, _exc| {
             let result = js_call_original(ctx, js_ctx_val, 0, std::ptr::null_mut());
             if return_type != b'V' {
                 let ret_u64 = js_result_to_raw(ctx, JSValue(result), return_type);
@@ -593,7 +625,6 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     }
     let _in_flight_guard = InFlightJavaHookGuard::enter();
     let _callback_scope = JavaHookCallbackScope::enter();
-    let _gate_guard = crate::jsapi::java::art_controller::CallbackGateGuard;
 
     let art_method_addr = user_data as u64;
 
@@ -701,6 +732,6 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
             (*ctx_ptr).intercept_leave = 1;
         },
         // JS 异常时保持默认 action=call original。
-        |_ctx, _js_ctx| {},
+        |_ctx, _js_ctx, _exc| {},
     );
 }

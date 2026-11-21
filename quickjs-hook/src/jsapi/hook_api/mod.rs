@@ -133,6 +133,12 @@ pub fn cut_native_hooks() {
 /// Phase 3 - 释放 native hook 的 JS callback。必须在全局 drain 之后调用，
 /// 保证 callback 引用的 JSValue 不再被正在执行的 thunk 访问。
 pub fn free_native_hooks() {
+    let Ok(_js_scope) = crate::execution_gate::EngineScope::enter_cleanup() else {
+        return;
+    };
+    if !crate::execution_gate::cleanup_scope_is_safe() {
+        return;
+    }
     let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(registry) = guard.take() {
         for (_addr, data) in registry {

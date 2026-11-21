@@ -78,10 +78,11 @@ fn parse_json_string_array(json: &str) -> Vec<String> {
 /// use the result as rustyline replacement candidates starting from after the dot.
 /// Returns an empty vec if the engine is not initialised or on any error.
 pub fn complete_script(prefix: &str) -> Vec<String> {
-    let engine = match JS_ENGINE.lock() {
-        Ok(g) => g,
+    let _scope = match crate::execution_gate::EngineScope::enter(None) {
+        Ok(scope) => scope,
         Err(_) => return vec![],
     };
+    let engine = unsafe { JS_ENGINE.get() };
     let engine = match engine.as_ref() {
         Some(e) => e,
         None => return vec![],

@@ -88,6 +88,7 @@ pub(super) type GetStaticMethodIdFn =
 pub(super) type ExcCheckFn = unsafe extern "C" fn(JniEnv) -> u8;
 pub(super) type ExcClearFn = unsafe extern "C" fn(JniEnv);
 pub(super) type ExcOccurredFn = unsafe extern "C" fn(JniEnv) -> *mut std::ffi::c_void;
+pub(super) type ThrowFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
 pub(super) type DeleteLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
 pub(super) type NewLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type NewGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
@@ -274,6 +275,15 @@ pub(super) unsafe fn jni_negative_or_exc(env: JniEnv, value: i32) -> bool {
 /// CallObjectMethod (no WalkStack). Bounded recursion depth (3 levels) on
 /// cause chain to avoid infinite loops from self-referencing causes.
 pub(super) unsafe fn jni_take_exception(env: JniEnv) -> Option<String> {
+    match crate::execution_gate::with_external_current(|| {
+        Ok(jni_take_exception_inner(env))
+    }) {
+        Ok(message) => message,
+        Err(error) => Some(format!("cooperative JNI exception inspection failed: {:?}", error)),
+    }
+}
+
+unsafe fn jni_take_exception_inner(env: JniEnv) -> Option<String> {
     if crate::is_raw_clone_js_thread() {
         return Some("JNI exception on raw clone thread; throwable inspection is disabled".to_string());
     }
@@ -300,6 +310,59 @@ pub(super) unsafe fn jni_take_exception(env: JniEnv) -> Option<String> {
     delete(env, throwable);
 
     Some(msg)
+}
+
+/// 捕获当前线程 pending 的 Java 异常并保活为全局引用。
+///
+/// 必须在 `$orig` 调用原方法返回后、恢复 QuickJS 执行前使用。JNI pending
+/// 异常必须清除（否则后续在 JS 里执行的 JNI 调用会处于异常状态），但身份
+/// 不能丢：全局引用交由回调收尾路径 `jni_rethrow_captured_exception` 以
+/// Throw() 恢复同一 throwable 对象，保证调用方拿到的就是原方法抛出的
+/// 那个异常实例（exactly-once：绝不通过重放原方法来“复现”异常）。
+/// 返回 0 表示无 pending 异常。
+pub(crate) unsafe fn jni_capture_pending_exception_global(env: JniEnv) -> u64 {
+    if env.is_null() {
+        return 0;
+    }
+    let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
+    if check(env) == 0 {
+        return 0;
+    }
+    let occurred: ExcOccurredFn = jni_fn!(env, ExcOccurredFn, JNI_EXCEPTION_OCCURRED);
+    let throwable = occurred(env); // local ref（可能为 null）
+    // 必须先 clear 才能安全对该 throwable 继续调用 JNI
+    let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
+    clear(env);
+    if throwable.is_null() {
+        return 0;
+    }
+    let new_global: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
+    let global = new_global(env, throwable);
+    let delete_local: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    delete_local(env, throwable);
+    global as u64
+}
+
+/// 把 `jni_capture_pending_exception_global` 保留的异常按原身份重新抛回 VM。
+/// 成功抛出后全局引用即被消费（删除）；返回 false 表示未恢复（调用方需退回
+/// 原有 fallback 语义）。
+pub(crate) unsafe fn jni_rethrow_captured_exception(env: JniEnv, global_ref: u64) -> bool {
+    if env.is_null() || global_ref == 0 {
+        return false;
+    }
+    let throw: ThrowFn = jni_fn!(env, ThrowFn, JNI_THROW);
+    let ok = throw(env, global_ref as *mut std::ffi::c_void) == 0;
+    let delete_global: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+    delete_global(env, global_ref as *mut std::ffi::c_void);
+    ok
+}
+
+/// 为已保留的（全局引用）throwable 生成可读摘要，仅用于日志与 JS message。
+pub(crate) unsafe fn jni_throwable_summary(env: JniEnv, global_ref: u64) -> String {
+    if env.is_null() || global_ref == 0 || crate::is_raw_clone_js_thread() {
+        return "java original threw".to_string();
+    }
+    format_throwable_chain(env, global_ref as *mut std::ffi::c_void, 0)
 }
 
 /// 递归提取 throwable 的 toString() + cause 链。depth 上限 3 层。
@@ -764,6 +827,7 @@ pub(super) const JNI_GET_SUPERCLASS: usize = 10;
 pub(super) const JNI_TO_REFLECTED_METHOD: usize = 9;
 #[allow(dead_code)]
 pub(super) const JNI_TO_REFLECTED_FIELD: usize = 12;
+pub(super) const JNI_THROW: usize = 13;
 pub(super) const JNI_EXCEPTION_OCCURRED: usize = 15;
 pub(super) const JNI_EXCEPTION_CLEAR: usize = 17;
 pub(super) const JNI_PUSH_LOCAL_FRAME: usize = 19;

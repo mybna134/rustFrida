@@ -1200,6 +1200,12 @@ pub fn set_host_stealth_mode(mode: i64) -> Result<u8, String> {
     Ok(mode as u8)
 }
 
+/// agent 卸载流程的早期置位：让延迟 entry-refresh 线程立即退出，
+/// 配合 raw_thread 的卸载闸门，保证 loader munmap agent ELF 前无存活线程。
+pub fn disable_java_hook_refresh() {
+    java_hook_api::install::set_refresh_disabled();
+}
+
 /// Register Java API: hook/unhook (C-level) + _methods, then eval boot script
 /// to set up the Proxy-based Java.use() API.
 /// Spawn 模式延迟 JNI 初始化：AttachCurrentThread + cache reflect IDs + 触发 gate hook。
@@ -1767,6 +1773,14 @@ pub fn free_java_hooks() {
     if !java_cleanup_needed() {
         return;
     }
+    let Ok(_js_scope) = crate::execution_gate::EngineScope::enter_cleanup() else {
+        // Callback JSValues belong to the live runtime. Keep resources pinned
+        // if execution is poisoned or the generation is closing.
+        return;
+    };
+    if !crate::execution_gate::cleanup_scope_is_safe() {
+        return;
+    }
 
     // router 表清空 (art_controller 的 OAT patch 已由 cut_art_controller_hooks revert)
     unsafe {
@@ -1790,8 +1804,6 @@ pub fn free_java_hooks() {
     } else {
         unsafe { get_thread_env().ok() }
     };
-    let _js_guard = crate::JS_ENGINE.try_lock();
-
     let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(registry) = guard.take() {
         for (_art_method, data) in registry {

@@ -126,7 +126,57 @@ impl RawThreadTls {
     }
 }
 
+/// 全局 detached 线程活性计数与卸载闸门（quickjs-hook 与 agent 两个 crate
+/// 各有一份 raw_thread 副本，但计 数必须统一：agent 卸载前要等所有来源的
+/// detached 线程退出，否则 loader munmap agent text 后线程醒来取指会
+/// SIGSEGV 杀死宿主进程）。本 crate 导出共享原语，agent 侧转发到这里。
+static ACTIVE_DETACHED_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static DETACHED_GATE_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn close_detached_gate() {
+    DETACHED_GATE_CLOSED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn detached_gate_closed() -> bool {
+    DETACHED_GATE_CLOSED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// agent crate 的转发入口（agent 侧 raw_thread.rs 只做薄包装）。
+pub fn spawn_detached_shared<F>(name: &'static [u8], func: F) -> Result<pid_t, String>
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_detached(name, func)
+}
+
+/// agent 侧转发用公开别名。
+pub fn sleep_ms_pub(ms: i64) {
+    sleep_ms(ms)
+}
+
+/// 等待全部 detached raw 线程退出。false = 超时仍有存活（调用方应放弃卸载、驻留）。
+pub fn wait_detached_drain(timeout_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    while ACTIVE_DETACHED_COUNT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        if start.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+            return false;
+        }
+        sleep_ms(10);
+    }
+    true
+}
+
 pub(crate) fn spawn_detached(name: &'static [u8], func: impl FnOnce() + Send + 'static) -> Result<pid_t, String> {
+    if detached_gate_closed() {
+        // 卸载尾段：不再创建新的 detached 线程
+        return Err("detached gate closed during unload".into());
+    }
+    ACTIVE_DETACHED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let counted = move || {
+        func();
+        ACTIVE_DETACHED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    };
+
     let stack_base = unsafe {
         mmap(
             null_mut(),
@@ -138,12 +188,13 @@ pub(crate) fn spawn_detached(name: &'static [u8], func: impl FnOnce() + Send + '
         )
     };
     if stack_base == libc::MAP_FAILED {
+        ACTIVE_DETACHED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Release);
         return Err("raw thread stack mmap failed".into());
     }
 
     let mut start = Box::new(RawThreadStart {
         name,
-        func: Some(Box::new(func)),
+        func: Some(Box::new(counted)),
         shadow: RawThreadTls::new(stack_base),
     });
     let child_tls = start.shadow.child_tls();
@@ -168,6 +219,7 @@ pub(crate) fn spawn_detached(name: &'static [u8], func: impl FnOnce() + Send + '
     } {
         Ok(tid) => Ok(tid),
         Err(e) => {
+            ACTIVE_DETACHED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Release);
             unsafe {
                 drop(Box::from_raw(start));
             }

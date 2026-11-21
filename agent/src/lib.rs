@@ -27,6 +27,8 @@ mod vma_name;
 #[cfg(feature = "frida-gum")]
 mod memory_dump;
 #[cfg(feature = "quickjs")]
+mod fallible_once;
+#[cfg(feature = "quickjs")]
 mod quickjs_loader;
 #[cfg(feature = "frida-gum")]
 mod stalker;
@@ -200,16 +202,34 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // 在途停止（控制端被 SIGKILL/异常退出）：socket 对端关闭后不再会
+                // 有任何命令，语义同构于 shutdown。此前这里直接 break 且两个标志
+                // 都为 false，agent 以半会话状态窃活（延迟 entry-refresh 线程、
+                // JS worker 等继续跑），实测下一次 hook 调用把宿主 SIGSEGV 崩掉
+                // （tombstone: 式样 runs/persist-27909-CRASH，SIGSEGV 发生在
+                // EOF 后 linger 状态的 art-refresh 线程）。
+                // 走与 shutdown 命令一致的清理序：安全排空、失败保留资源并
+                // 显式报错，绝不强行卸载。
+                log_msg_sync("控制端 EOF（在途停止），转入 shutdown 清理\n".to_string());
+                SHOULD_EXIT.store(true, Ordering::Relaxed);
+                break;
+            }
             Err(e) => {
-                // 读取错误
+                // 读取错误同样是终态：对端可能已死，write_stream 丢弃即可。
+                // 与 EOF 同语义安全收尾，避免半会话状态。
                 write_stream(format!("读取命令错误: {}", e).as_bytes());
+                log_msg_sync("控制通道读错误，转入 shutdown 清理\n".to_string());
+                SHOULD_EXIT.store(true, Ordering::Relaxed);
                 break;
             }
         }
     }
     if SHOULD_EXIT.load(Ordering::Relaxed) {
         log_msg_sync("收到 shutdown，开始退出清理\n".to_string());
+        // 早期置位：延迟 entry-refresh 线程尽快退出，缩短卸载排空窗口
+        #[cfg(feature = "quickjs")]
+        quickjs_hook::jsapi::java::disable_java_hook_refresh();
     } else if SHOULD_DETACH.load(Ordering::Relaxed) {
         log_msg_sync("收到 detach，跳过目标进程内清理，准备关闭 socket\n".to_string());
     }
@@ -421,7 +441,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-    match raw_thread::spawn_detached(b"wwb-js\0", move || {
+    match raw_thread::spawn_detached(b"qjs-worker\0", move || {
         let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
             let msg = payload
@@ -468,6 +488,21 @@ fn cleanup_agent_runtime_for_unload(fast_unload_ok: bool) -> bool {
             safe_to_return = quickjs_loader::cleanup_for_unload_leak_safe();
         }
     }
+    // 卸载闸门 + detached 线程排空：loader 返回后会把 agent ELF 整体 munmap，
+    // 任何存活的 detached raw 线程（rf-art-refresh 延迟刷新、JS 任务 worker 等）
+    // 醒来取指都会落在已 unmap 的 text 上，直接 SIGSEGV 杀死宿主进程
+    // —— 被壳兜底弹成"检测到调试器"。这里必须等所有 detached 线程退出；
+    // 等不到就保留 agent 驻留（park），绝不返回 unmap。
+    raw_thread::close_detached_gate();
+    if safe_to_return {
+        log_msg_sync("等待 detached raw 线程排空…\n".to_string());
+        if !raw_thread::wait_detached_drain(4_000) {
+            log_msg_sync(
+                "detached 线程未在 4s 内退出，放弃卸载以避免 munmap 竞态 SIGSEGV\n".to_string(),
+            );
+            safe_to_return = false;
+        }
+    }
     if safe_to_return {
         crash_handler::uninstall_crash_handlers();
     }
@@ -489,7 +524,7 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            raw_thread::spawn_detached(b"wwb-trace\0", move || {
+            raw_thread::spawn_detached(b"trace-worker\0", move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
                         write_stream(format!("clone success {}", pid).as_bytes());

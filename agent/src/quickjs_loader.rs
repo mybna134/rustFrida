@@ -14,7 +14,8 @@ use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
     cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
     drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine,
-    init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
+    init_hook_engine, load_script, load_script_with_filename, prepare_engine_cleanup,
+    set_art_controller_reload_paused, set_console_callback,
     set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 use std::collections::VecDeque;
@@ -31,6 +32,7 @@ const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 1_500;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static HOOK_RUNTIME_INIT_LOCK: Mutex<()> = Mutex::new(());
 static JAVA_WORKER_START_REQUESTED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_LOOP_ENTERED: AtomicBool = AtomicBool::new(false);
@@ -134,9 +136,15 @@ struct ExecMemory {
 impl ExecMemory {
     /// 调用 C 侧 hook_mmap_near 扫描 maps 空隙分配 nearby RWX 内存。
     /// hint=0 时退化为普通 mmap。
-    fn new_near(size: usize, hint: usize) -> Option<Self> {
-        let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
-        let alloc_size = ((size + page_size - 1) / page_size) * page_size;
+    fn new_near(size: usize, hint: usize) -> Result<Self, String> {
+        let page_size = unsafe { sysconf(_SC_PAGESIZE) };
+        if page_size <= 0 || size == 0 {
+            return Err(format!("Invalid executable allocation size/page size: {}/{}", size, page_size));
+        }
+        let page_size = page_size as usize;
+        let alloc_size = size.checked_add(page_size - 1)
+            .and_then(|rounded| (rounded / page_size).checked_mul(page_size))
+            .ok_or_else(|| "Executable allocation size overflow".to_string())?;
 
         extern "C" {
             fn hook_mmap_near(target: *mut std::ffi::c_void, alloc_size: usize) -> *mut std::ffi::c_void;
@@ -144,8 +152,11 @@ impl ExecMemory {
 
         let ptr = unsafe { hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size) };
 
-        if ptr == MAP_FAILED as *mut std::ffi::c_void {
-            return None;
+        if ptr.is_null() || ptr == MAP_FAILED as *mut std::ffi::c_void {
+            return Err(format!(
+                "Failed to allocate executable memory: size={}, hint={:#x}, error={}",
+                alloc_size, hint, std::io::Error::last_os_error()
+            ));
         }
 
         match set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME) {
@@ -153,13 +164,13 @@ impl ExecMemory {
             Err(_) => {}
         }
 
-        Some(ExecMemory {
+        Ok(ExecMemory {
             ptr: ptr as *mut u8,
             size: alloc_size,
         })
     }
 
-    fn new(size: usize) -> Option<Self> {
+    fn new(size: usize) -> Result<Self, String> {
         Self::new_near(size, 0)
     }
 
@@ -193,10 +204,17 @@ pub fn init_hook_runtime() -> Result<(), String> {
         return Ok(());
     }
 
-    // Allocate executable memory for hooks (64KB), near libart.so for ADRP range
+    let _initializing = HOOK_RUNTIME_INIT_LOCK.lock()
+        .map_err(|_| "Hook runtime initialization lock is poisoned".to_string())?;
+    if HOOK_RUNTIME_INITIALIZED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    // Keep the nearby-address constraint, but publish only a successful
+    // allocation. Exhaustion must return an error, not abort the target app.
     let libart_hint = find_libart_base().unwrap_or(0);
-    let exec_mem = EXEC_MEM
-        .get_or_init(|| ExecMemory::new_near(64 * 1024, libart_hint).expect("Failed to allocate executable memory"));
+    let exec_mem = crate::fallible_once::get_or_try_init(&EXEC_MEM, ||
+        ExecMemory::new_near(64 * 1024, libart_hint))?;
 
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
@@ -252,6 +270,7 @@ unsafe extern "C" fn java_worker_native_loop(
     _env: *mut *const *const std::ffi::c_void,
     _cls: *mut std::ffi::c_void,
 ) -> u8 {
+    write_stream(b"[diag] worker native loop entered");
     JAVA_WORKER_TID.store(libc::syscall(libc::SYS_gettid) as i32, Ordering::Release);
     JAVA_WORKER_LOOP_ENTERED.store(true, Ordering::Release);
     JAVA_WORKER_LOOP_RUNNING.store(true, Ordering::Release);
@@ -326,6 +345,8 @@ fn wait_java_worker_loop_entered(timeout_ms: u64) -> bool {
 }
 
 pub fn start_java_worker() -> Result<(), String> {
+    // TEMP-DIAG
+    write_stream(b"[diag] start_java_worker entered");
     if JAVA_WORKER_STARTED.load(Ordering::Acquire) {
         if JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
             return Ok(());
@@ -341,11 +362,13 @@ pub fn start_java_worker() -> Result<(), String> {
     JAVA_WORKER_NATIVE_RELEASED.store(false, Ordering::Release);
     JAVA_WORKER_TID.store(0, Ordering::Release);
     JAVA_WORKER_START_REQUESTED.store(true, Ordering::Release);
+    write_stream(b"[diag] spawning java worker thread");
     if let Err(err) = quickjs_hook::start_java_worker_thread(java_worker_native_loop as *mut std::ffi::c_void) {
         JAVA_WORKER_START_REQUESTED.store(false, Ordering::Release);
         return Err(err);
     }
     JAVA_WORKER_STARTED.store(true, Ordering::Release);
+    write_stream(b"[diag] waiting for worker loop entry");
     if !wait_java_worker_loop_entered(JAVA_WORKER_LOOP_READY_TIMEOUT_MS) {
         JAVA_WORKER_START_REQUESTED.store(false, Ordering::Release);
         JAVA_WORKER_STARTED.store(false, Ordering::Release);
@@ -420,7 +443,9 @@ pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) 
     {
         return Err("Java worker busy: previous Java eval is still running".to_string());
     }
+
     let (tx, rx) = mpsc::channel();
+    write_stream(b"[diag] eval in-flight acquired, pushing task");
     queue.push(JavaWorkerTask::Eval {
         script,
         filename,
@@ -553,6 +578,11 @@ pub fn cleanup() -> bool {
         stage("cleanup detach_jni_thread", &mut t);
         return false;
     }
+    if !prepare_engine_cleanup() {
+        log_msg("[quickjs] JS activations did not drain; preserving hook resources\n".to_string());
+        detach_current_jni_thread();
+        return false;
+    }
 
     // ============================================================
     // Phase 3: 切断 walkstack guard，再停止新 recomp 执行，并等待所有线程活动栈离开 hook/recomp 地址。
@@ -619,7 +649,10 @@ pub fn cleanup() -> bool {
     }
     detach_current_jni_thread();
     stage("phase4 detach_jni_thread", &mut t);
-    cleanup_engine();
+    if !cleanup_engine() {
+        log_msg("[quickjs] engine retirement refused; retaining executable resources\n".to_string());
+        return false;
+    }
     stage("phase4 cleanup_engine", &mut t);
     cleanup_wxshadow_patches();
     stage("phase4 cleanup_wxshadow_patches", &mut t);
@@ -739,6 +772,11 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
         stage("cleanup detach_jni_thread", &mut t);
         return false;
     }
+    if !prepare_engine_cleanup() {
+        log_msg("[quickjs] JS activations did not drain; preserving hook resources\n".to_string());
+        detach_current_jni_thread();
+        return false;
+    }
 
     // Stop the Java worker only after hook entry points are cut and all managed
     // helper invocations have drained. Its final JNI call unregisters every
@@ -790,7 +828,10 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     }
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
-    cleanup_engine();
+    if !cleanup_engine() {
+        log_msg("[quickjs] engine retirement refused; retaining executable resources\n".to_string());
+        return false;
+    }
     stage("phase3 cleanup_engine", &mut t);
 
     log_msg(format!(
@@ -821,6 +862,7 @@ pub fn cleanup_soft() -> Result<(), String> {
     if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
         return Err("JS 引擎未初始化".to_string());
     }
+    ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
 
     let t0 = Instant::now();
     let mut t = t0;
@@ -858,6 +900,11 @@ pub fn cleanup_soft() -> Result<(), String> {
         stage("soft cleanup detach_jni_thread", &mut t);
         return Err("drain timeout，软清理已放弃".to_string());
     }
+    if !prepare_engine_cleanup() {
+        set_art_controller_reload_paused(false);
+        detach_current_jni_thread();
+        return Err("JS activations did not drain; preserving hook resources".to_string());
+    }
 
     // Phase 3: 完整 free JS hook 资源 + 销毁 runtime
     free_java_hooks();
@@ -868,8 +915,9 @@ pub fn cleanup_soft() -> Result<(), String> {
     stage("phase3 resume_art_controller_reload", &mut t);
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
-    ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    cleanup_engine();
+    if !cleanup_engine() {
+        return Err("engine retirement refused; keeping runtime and hook resources mapped".to_string());
+    }
     stage("phase3 cleanup_engine", &mut t);
 
     log_msg(format!(

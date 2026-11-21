@@ -100,10 +100,27 @@ fn mark_original_entry_mutated(art_method: u64) {
     });
 }
 
+/// agent 卸载闸门的 quickjs-hook 侧镜像：置位后，
+/// schedule_internal_shared_entry_refresh 的所有延迟 tick 立即退出，
+/// 保证 detached 线程尽早排空（unmap 前无存活）。
+static REFRESH_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_refresh_disabled() {
+    REFRESH_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn refresh_disabled() -> bool {
+    REFRESH_DISABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn schedule_internal_shared_entry_refresh(art_method: u64, ep_offset: usize, bridge: &'static ArtBridgeFunctions) {
-    let _ = crate::raw_thread::spawn_detached(b"rf-art-refresh\0", move || {
+    let _ = crate::raw_thread::spawn_detached(b"art-refresh\0", move || {
         for delay_ms in [120_i64, 400, 900] {
             crate::raw_thread::sleep_ms(delay_ms);
+            // 卸载闸门已关（cleanup 尾段）：立即退出，让 unmap 前的排空等待尽快收口
+            if refresh_disabled() {
+                return;
+            }
             let still_registered =
                 with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
             if !still_registered {

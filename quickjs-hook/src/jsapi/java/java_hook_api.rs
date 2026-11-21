@@ -3,7 +3,7 @@
 //! 安装、卸载与安装期资源回滚拆分到子模块，降低单文件复杂度。
 
 mod fast_install;
-mod install;
+pub(crate) mod install;
 mod install_support;
 mod managed_dex_builder;
 mod managed_install;

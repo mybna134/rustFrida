@@ -23,8 +23,11 @@ struct NativeHookFrame {
     orig_called: bool,
 }
 
-// JS 回调在全局引擎锁下串行执行，因此用一个栈保存 native hook 回调状态即可支持嵌套 hook。
-static NATIVE_HOOK_STACK: Mutex<Vec<NativeHookFrame>> = Mutex::new(Vec::new());
+// A suspended activation resumes on its original OS thread. A process-wide
+// stack would mix frames from unrelated activations under non-LIFO resumes.
+thread_local! {
+    static NATIVE_HOOK_STACK: RefCell<Vec<NativeHookFrame>> = const { RefCell::new(Vec::new()) };
+}
 static IN_FLIGHT_NATIVE_HOOK_CALLBACKS: Mutex<usize> = Mutex::new(0);
 static IN_FLIGHT_NATIVE_HOOK_CALLBACKS_CV: Condvar = Condvar::new();
 
@@ -53,47 +56,46 @@ impl Drop for InFlightNativeHookGuard {
 }
 
 fn push_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) {
-    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    stack.push(NativeHookFrame {
-        ctx_ptr: ctx_ptr as usize,
-        trampoline,
-        orig_called: false,
+    NATIVE_HOOK_STACK.with(|cell| {
+        cell.borrow_mut().push(NativeHookFrame {
+            ctx_ptr: ctx_ptr as usize,
+            trampoline,
+            orig_called: false,
+        });
     });
 }
 
 fn pop_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -> bool {
-    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(frame) = stack.pop() {
-        debug_assert_eq!(frame.ctx_ptr, ctx_ptr as usize);
-        debug_assert_eq!(frame.trampoline, trampoline);
-        frame.orig_called
-    } else {
-        false
-    }
+    NATIVE_HOOK_STACK.with(|cell| {
+        if let Some(frame) = cell.borrow_mut().pop() {
+            debug_assert_eq!(frame.ctx_ptr, ctx_ptr as usize);
+            debug_assert_eq!(frame.trampoline, trampoline);
+            frame.orig_called
+        } else {
+            false
+        }
+    })
 }
 
 fn mark_native_hook_frame_orig_called(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -> bool {
-    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(frame) = stack
-        .iter_mut()
-        .rfind(|frame| frame.ctx_ptr == ctx_ptr as usize && frame.trampoline == trampoline)
-    {
-        frame.orig_called = true;
-        true
-    } else {
-        false
-    }
+    NATIVE_HOOK_STACK.with(|cell| {
+        if let Some(frame) = cell.borrow_mut().iter_mut().rfind(|frame| {
+            frame.ctx_ptr == ctx_ptr as usize && frame.trampoline == trampoline
+        }) {
+            frame.orig_called = true;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn current_native_hook_frame() -> Option<(*mut hook_ffi::HookContext, u64)> {
-    let stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    stack
-        .last()
-        .map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
-}
-
-fn native_callback_would_reenter_js_engine() -> bool {
-    crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == crate::current_thread_id_u64()
+    NATIVE_HOOK_STACK.with(|cell| {
+        cell.borrow().last().map(|frame| {
+            (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline)
+        })
+    })
 }
 
 pub(crate) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
@@ -194,13 +196,6 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         (hook_data.ctx, hook_data.callback_bytes, hook_data.trampoline)
     }; // HOOK_REGISTRY lock released here
 
-    if native_callback_would_reenter_js_engine() {
-        if trampoline != 0 {
-            (*ctx_ptr).x[0] = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
-        }
-        return;
-    }
-
     push_native_hook_frame(ctx_ptr, trampoline);
 
     // Track whether the JS callback completed without exception and wrote back x0.
@@ -253,7 +248,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             // undefined 时保持 ctx.x0 (可能是 $orig() 写入的返回值或 JS 修改的值)
         },
         // native hook 不需要 JS 异常内 fallback (外层 trampoline 兜底已够)
-        |_ctx, _js_ctx| {},
+        |_ctx, _js_ctx, _exc| {},
     );
 
     let orig_called = pop_native_hook_frame(ctx_ptr, trampoline);
@@ -321,8 +316,16 @@ unsafe extern "C" fn js_native_call_original(
         hook_ctx.x[i] = js_value_to_u64_or_zero(ctx, val);
     }
 
+    let result = match crate::execution_gate::with_external(ctx, || {
+        Ok(hook_ffi::hook_invoke_trampoline(
+            ctx_ptr,
+            trampoline as *mut std::ffi::c_void,
+        ))
+    }) {
+        Ok(value) => value,
+        Err(error) => return crate::execution_gate::error_value(ctx, error.kind()),
+    };
     let _ = mark_native_hook_frame_orig_called(ctx_ptr, trampoline);
-    let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
 
     // Write result back to HookContext.x[0] so the thunk's final RET returns this value
     (*ctx_ptr).x[0] = result;

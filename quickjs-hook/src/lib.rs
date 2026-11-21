@@ -26,11 +26,12 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod completion;
+mod execution_gate;
 pub mod context;
 pub mod fast_hook;
 pub mod ffi;
 pub mod jsapi;
-mod raw_thread;
+pub mod raw_thread;
 pub mod recomp;
 pub mod runtime;
 pub mod value;
@@ -61,14 +62,14 @@ pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
+pub(crate) const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
 
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-static JS_EXECUTION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_qbdi_output_dir(output_dir: impl Into<String>) {
     let _ = QBDI_OUTPUT_DIR.set(output_dir.into());
@@ -86,12 +87,25 @@ pub(crate) fn qbdi_helper_blob() -> Option<Vec<u8>> {
     QBDI_HELPER_BLOB.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Global JS engine instance (protected by Mutex).
-/// pub(crate) so hook_callback_wrapper can serialize concurrent JS_Call invocations.
-pub(crate) static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
-/// Best-effort owner tracking for the thread currently executing inside the global JS engine.
-/// Used by hook callbacks to distinguish same-thread reentrancy from ordinary contention.
-pub(crate) static JS_ENGINE_OWNER_THREAD: AtomicU64 = AtomicU64::new(0);
+/// The global runtime is accessed only while holding an execution_gate scope.
+pub(crate) struct EngineCell(UnsafeCell<Option<JSEngine>>);
+
+unsafe impl Sync for EngineCell {}
+
+impl EngineCell {
+    /// # Safety
+    /// The caller must hold the process-wide execution gate, and may mutate
+    /// this cell only during initialization or destruction with no live JS frame.
+    pub(crate) unsafe fn get(&self) -> &Option<JSEngine> {
+        &*self.0.get()
+    }
+
+    pub(crate) unsafe fn get_mut(&self) -> &mut Option<JSEngine> {
+        &mut *self.0.get()
+    }
+}
+
+pub(crate) static JS_ENGINE: EngineCell = EngineCell(UnsafeCell::new(None));
 
 static RAW_CLONE_JS_THREAD_0: AtomicU64 = AtomicU64::new(0);
 static RAW_CLONE_JS_THREAD_1: AtomicU64 = AtomicU64::new(0);
@@ -160,56 +174,7 @@ pub(crate) fn current_thread_id_u64() -> u64 {
     tpidr
 }
 
-#[inline]
-pub(crate) fn mark_js_engine_owner_current_thread() {
-    JS_ENGINE_OWNER_THREAD.store(current_thread_id_u64(), Ordering::Release);
-}
-
-#[inline]
-pub(crate) fn clear_js_engine_owner_current_thread() {
-    let current = current_thread_id_u64();
-    let _ = JS_ENGINE_OWNER_THREAD.compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed);
-}
-
-struct JsEngineOwnerGuard;
-
-impl JsEngineOwnerGuard {
-    fn acquire() -> Self {
-        mark_js_engine_owner_current_thread();
-        JsEngineOwnerGuard
-    }
-}
-
-impl Drop for JsEngineOwnerGuard {
-    fn drop(&mut self) {
-        clear_js_engine_owner_current_thread();
-    }
-}
-
-struct JsExecutionDeadlineGuard {
-    previous_deadline_ms: u64,
-}
-
-impl JsExecutionDeadlineGuard {
-    fn begin(timeout_ms: u64) -> Self {
-        let previous_deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
-        let deadline_ms = if timeout_ms == 0 {
-            0
-        } else {
-            monotonic_ms().saturating_add(timeout_ms)
-        };
-        JS_EXECUTION_DEADLINE_MS.store(deadline_ms, Ordering::Release);
-        Self { previous_deadline_ms }
-    }
-}
-
-impl Drop for JsExecutionDeadlineGuard {
-    fn drop(&mut self) {
-        JS_EXECUTION_DEADLINE_MS.store(self.previous_deadline_ms, Ordering::Release);
-    }
-}
-
-fn monotonic_ms() -> u64 {
+pub(crate) fn monotonic_ms() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if ret != 0 {
@@ -221,8 +186,7 @@ fn monotonic_ms() -> u64 {
 }
 
 pub(crate) fn js_execution_deadline_expired() -> bool {
-    let deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
-    deadline_ms != 0 && monotonic_ms() >= deadline_ms
+    execution_gate::current_deadline_expired()
 }
 
 /// Log callback registered with the C hook engine.
@@ -364,15 +328,15 @@ impl Drop for JSEngine {
     }
 }
 
-// Safety: JSEngine is protected by Mutex, ensuring single-threaded access
+// Safety: all process-wide JSEngine access holds the execution gate lease.
 unsafe impl Send for JSEngine {}
 unsafe impl Sync for JSEngine {}
 
 /// Get or initialize the global JS engine
 pub fn get_or_init_engine() -> Result<(), String> {
-    let mut engine = JS_ENGINE
-        .lock()
-        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let _scope = execution_gate::EngineScope::enter(None)
+        .map_err(|e| format!("Failed to enter JS engine: {:?}", e))?;
+    let engine = unsafe { JS_ENGINE.get_mut() };
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
@@ -389,15 +353,13 @@ pub fn load_script(script: &str) -> Result<String, String> {
 
 /// Load + execute with an explicit filename (用于 QuickJS 报错时显示 `filename:line:col`)。
 pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
-    let mut engine = JS_ENGINE
-        .lock()
-        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let _scope = execution_gate::EngineScope::enter(Some(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS))
+        .map_err(|e| format!("Failed to enter JS engine: {:?}", e))?;
+    let engine = unsafe { JS_ENGINE.get_mut() };
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
-    let _owner_guard = JsEngineOwnerGuard::acquire();
-    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
     let value = engine.eval_file(script, filename)?;
     engine.flush_java_ready_callbacks()?;
     engine.run_pending_jobs();
@@ -448,12 +410,10 @@ fn js_string_literal(s: &str) -> String {
 /// * `Ok(json)` - 返回值的 JSON 字符串表示；`undefined` 返回 `"null"`
 /// * `Err(msg)` - 引擎未初始化 / 方法不存在 / JS 异常
 pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
-    let engine = JS_ENGINE
-        .lock()
-        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let _scope = execution_gate::EngineScope::enter(Some(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS))
+        .map_err(|e| format!("Failed to enter JS engine: {:?}", e))?;
+    let engine = unsafe { JS_ENGINE.get() };
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
-    let _owner_guard = JsEngineOwnerGuard::acquire();
-    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
 
     // 构造 `__rpc_dispatch("method", "args_json")` 表达式。
     let script = format!(
@@ -472,8 +432,35 @@ pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
 }
 
 /// Cleanup the global JS engine
-pub fn cleanup_engine() {
-    if let Ok(mut engine) = JS_ENGINE.lock() {
-        *engine = None;
+pub fn prepare_engine_cleanup() -> bool {
+    if execution_gate::begin_close().is_err() { return false; }
+    let Ok(scope) = execution_gate::EngineScope::enter_retirement() else { return false; };
+    let ready = execution_gate::ready_to_retire() &&
+        unsafe { JS_ENGINE.get() }.as_ref().is_none_or(|engine| {
+            let runtime = engine.runtime().as_ptr();
+            unsafe { ffi::JS_GetCooperativeStateCount(runtime) == 0 &&
+                ffi::JS_GetSuspendedExecutionCount(runtime) == 0 }
+        });
+    drop(scope);
+    ready
+}
+
+/// Destroy the runtime after `prepare_engine_cleanup` and hook resource drain.
+pub fn cleanup_engine() -> bool {
+    if execution_gate::begin_close().is_err() { return false; }
+    let Ok(scope) = execution_gate::EngineScope::enter_retirement() else { return false };
+    if !execution_gate::ready_to_retire() {
+        return false;
     }
+    if let Some(engine) = unsafe { JS_ENGINE.get() }.as_ref() {
+        let runtime = engine.runtime().as_ptr();
+        if unsafe { ffi::JS_GetCooperativeStateCount(runtime) } != 0 ||
+            unsafe { ffi::JS_GetSuspendedExecutionCount(runtime) } != 0 {
+            return false;
+        }
+    }
+    unsafe { *JS_ENGINE.get_mut() = None; }
+    drop(scope);
+    execution_gate::try_destroy().is_ok() &&
+        execution_gate::open_next_generation().is_ok()
 }

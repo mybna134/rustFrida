@@ -1083,14 +1083,6 @@ pub(crate) fn cached_thread_top_quick_frame_offset() -> Option<usize> {
     Some(thread_spec.managed_stack_offset + ms_spec.top_quick_frame_offset)
 }
 
-/// Callback gate: 只允许一个线程进入完整 JNI trampoline → callback 路径。
-/// 在 art_router_stack_check 中 CAS 获取，在 java_hook_callback 末尾（guard drop）释放。
-pub(crate) static JAVA_CALLBACK_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Gate 冷却计数器：释放后 N 次调用全部 bypass，避免主线程频繁走 $orig JNI 路径
-static GATE_COOLDOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static GATE_COOLDOWN_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 const HOT_METHOD_SAMPLER_SLOTS: usize = 16;
 static HOT_METHOD_SAMPLER_ORIGINALS: [std::sync::atomic::AtomicU64; HOT_METHOD_SAMPLER_SLOTS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; HOT_METHOD_SAMPLER_SLOTS];
@@ -1150,17 +1142,6 @@ fn should_sample_original_method(original: u64) -> bool {
         return count % every_n as u64 == 0;
     }
     true
-}
-
-pub(crate) struct CallbackGateGuard;
-impl Drop for CallbackGateGuard {
-    fn drop(&mut self) {
-        GATE_COOLDOWN.store(
-            GATE_COOLDOWN_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Release,
-        );
-        JAVA_CALLBACK_GATE.store(false, std::sync::atomic::Ordering::Release);
-    }
 }
 
 pub(super) static DO_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1414,7 +1395,7 @@ pub(crate) fn get_interpreter_bridge() -> u64 {
 }
 
 /// C-callable：art_router thunk + DoCall hook 调用，判断是否应该路由。
-/// 返回 1 = 正常路由到 replacement，返回 0 = 跳过（callOriginal bypass 或 stack 递归 或 JS engine 繁忙）。
+/// 返回 1 = 正常路由到 replacement，返回 0 = callOriginal bypass 或 stack 递归。
 #[no_mangle]
 pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     if art_controller_reload_paused() {
@@ -1440,33 +1421,6 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     }
     if !should_sample_original_method(original_for_js) {
         return 0;
-    }
-
-    // JS hook: JS engine busy 检测 + cooldown gate
-    let current_thread = crate::current_thread_id_u64();
-    let owner = crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire);
-    if owner == current_thread {
-        // reentrant ($orig path)
-    } else if owner != 0 {
-        return 0; // JS 被别人占用
-    } else {
-        // 冷却期：gate 释放后 N 次调用全部 bypass，避免主线程频繁走 $orig JNI
-        if GATE_COOLDOWN.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-            GATE_COOLDOWN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return 0;
-        }
-        // CAS gate: 只允许一个线程进入完整路径
-        if JAVA_CALLBACK_GATE
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return 0;
-        }
     }
 
     // Per-thread bypass stack: 检查栈中是否有 entry 匹配当前 replacement 的 original

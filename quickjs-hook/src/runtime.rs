@@ -66,7 +66,7 @@ impl Drop for JSRuntime {
     }
 }
 
-// Safety: JSRuntime is protected by Mutex in the global JS_ENGINE, ensuring single-threaded access
+// Safety: global JSRuntime access holds the execution gate lease.
 unsafe impl Send for JSRuntime {}
 unsafe impl Sync for JSRuntime {}
 

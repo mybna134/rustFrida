@@ -849,6 +849,20 @@ unsafe fn js_value_from_jni_return(
     return_type: u8,
     return_type_sig: &str,
 ) -> ffi::JSValue {
+    // 原方法抛出的 Java 异常绝不能被降级成 null/0 返回值：那会吞掉业务语义，
+    // 并触发收尾路径重放原方法（exactly-once 破坏）。先保留 pending 异常的
+    // 身份为全局引用，再以携带 `__jthrowable` 的 JS Error 抛回脚本；回调
+    // 收尾（hook.rs）用 Throw() 恢复同一实例，见 mixed-lock fixture throw 场景。
+    let preserved_throwable = jni_capture_pending_exception_global(env);
+    if preserved_throwable != 0 {
+        let err = ffi::JS_NewError(ctx);
+        let wrapped = JSValue(err);
+        let summary = jni_throwable_summary(env, preserved_throwable);
+        wrapped.set_property(ctx, "message", JSValue::string(ctx, &summary));
+        let ptr_val = ffi::JS_NewBigUint64(ctx, preserved_throwable);
+        wrapped.set_property(ctx, "__jthrowable", JSValue(ptr_val));
+        return ffi::JS_Throw(ctx, err);
+    }
     match return_type {
         b'V' => ffi::qjs_undefined(),
         b'Z' => JSValue::bool(ret_raw != 0).raw(),
@@ -1080,10 +1094,30 @@ unsafe extern "C" fn js_call_original(
     // pointer, not a jobject transition ref. Invoke the relocated quick
     // trampoline with the saved quick registers instead.
     if hook_ctx.x[0] == art_method_addr && quick_trampoline != 0 && native_entry_trampoline == 0 {
-        let ret_x0 = hook_ffi::hook_invoke_trampoline(
-            ctx_ptr,
-            quick_trampoline as *mut std::ffi::c_void,
-        );
+        let ret_x0 = match crate::execution_gate::with_external(ctx, || {
+            Ok(hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                quick_trampoline as *mut std::ffi::c_void,
+            ))
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                // 三态:NotExecuted 可重放;Executed 已发生,写回结果并标记,严禁重放。
+                if let crate::execution_gate::ExternalOutcome::Executed(kind, executed_value) = error {{
+                    if let Some(raw) = executed_value {{
+                        let ret_raw = if matches!(return_type, b'F' | b'D') {{
+                            (*ctx_ptr).d[0]
+                        }} else {{
+                            raw
+                        }};
+                        (*ctx_ptr).x[0] = ret_raw;
+                    }}
+                    crate::execution_gate::mark_external_executed(0);
+                    return crate::execution_gate::error_value(ctx, kind);
+                }}
+                return crate::execution_gate::error_value(ctx, error.kind());
+            },
+        };
         let ret_raw = if matches!(return_type, b'F' | b'D') {
             (*ctx_ptr).d[0]
         } else {
@@ -1100,10 +1134,29 @@ unsafe extern "C" fn js_call_original(
                 b"orig(...args) is not supported for critical native hooks\0".as_ptr() as *const _,
             );
         }
-        let ret_x0 = hook_ffi::hook_invoke_trampoline(
-            ctx_ptr,
-            native_entry_trampoline as *mut std::ffi::c_void,
-        );
+        let ret_x0 = match crate::execution_gate::with_external(ctx, || {
+            Ok(hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                native_entry_trampoline as *mut std::ffi::c_void,
+            ))
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                if let crate::execution_gate::ExternalOutcome::Executed(kind, executed_value) = error {
+                    if let Some(raw) = executed_value {
+                        let ret_raw = if matches!(return_type, b'F' | b'D') {
+                            (*ctx_ptr).d[0]
+                        } else {
+                            raw
+                        };
+                        (*ctx_ptr).x[0] = ret_raw;
+                    }
+                    crate::execution_gate::mark_external_executed(0);
+                    return crate::execution_gate::error_value(ctx, kind);
+                }
+                return crate::execution_gate::error_value(ctx, error.kind());
+            },
+        };
         let ret_raw = if matches!(return_type, b'F' | b'D') {
             (*ctx_ptr).d[0]
         } else {
@@ -1141,25 +1194,56 @@ unsafe extern "C" fn js_call_original(
             } else {
                 jargs.as_ptr() as *const std::ffi::c_void
             };
-            let ret_raw = invoke_original_jni(
-                env,
-                art_method_addr,
-                class_global_ref,
-                hook_ctx.x[1],
-                return_type,
-                is_static,
-                jargs_ptr,
-                quick_trampoline,
-                use_blr,
-            );
+            let ret_raw = match crate::execution_gate::with_external(ctx, || {
+                Ok(invoke_original_jni(
+                    env, art_method_addr, class_global_ref, hook_ctx.x[1],
+                    return_type, is_static, jargs_ptr, quick_trampoline, use_blr,
+                ))
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    delete_owned_jvalue_refs(env, &supplied_owned_refs);
+                    if let crate::execution_gate::ExternalOutcome::Executed(kind, executed_value) = error {
+                        // 副作用已发生:原方法抛出的 Java 异常捕获为全局引用交由收尾
+                        // 按身份 Throw;返回值写回寄存器;严禁重放。
+                        let pending = jni_capture_pending_exception_global(env);
+                        if let Some(raw) = executed_value {
+                            write_primitive_return_to_context(ctx_ptr, return_type, raw);
+                        }
+                        crate::execution_gate::mark_external_executed(pending);
+                        return crate::execution_gate::error_value(ctx, kind);
+                    }
+                    return crate::execution_gate::error_value(ctx, error.kind());
+                }
+            };
             delete_owned_jvalue_refs(env, &supplied_owned_refs);
             return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
         }
 
-        let ret_x0 = hook_ffi::hook_invoke_trampoline(
-            ctx_ptr,
-            native_entry_trampoline as *mut std::ffi::c_void,
-        );
+        let ret_x0 = match crate::execution_gate::with_external(ctx, || {
+            Ok(hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                native_entry_trampoline as *mut std::ffi::c_void,
+            ))
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                if let crate::execution_gate::ExternalOutcome::Executed(kind, executed_value) = error {
+                    let pending = jni_capture_pending_exception_global(env);
+                    if let Some(raw) = executed_value {
+                        let ret_raw = if matches!(return_type, b'F' | b'D') {
+                            (*ctx_ptr).d[0]
+                        } else {
+                            raw
+                        };
+                        (*ctx_ptr).x[0] = ret_raw;
+                    }
+                    crate::execution_gate::mark_external_executed(pending);
+                    return crate::execution_gate::error_value(ctx, kind);
+                }
+                return crate::execution_gate::error_value(ctx, error.kind());
+            },
+        };
         let ret_raw = if matches!(return_type, b'F' | b'D') {
             (*ctx_ptr).d[0]
         } else {
@@ -1210,17 +1294,29 @@ unsafe extern "C" fn js_call_original(
         }
     }
 
-    let ret_raw = invoke_original_jni(
-        env,
-        art_method_addr,
-        class_global_ref,
-        hook_ctx.x[1],
-        return_type,
-        is_static,
-        jargs_ptr,
-        quick_trampoline,
-        use_blr,
-    );
+    let ret_raw = match crate::execution_gate::with_external(ctx, || {
+        Ok(invoke_original_jni(
+            env, art_method_addr, class_global_ref, hook_ctx.x[1],
+            return_type, is_static, jargs_ptr, quick_trampoline, use_blr,
+        ))
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            delete_owned_jvalue_refs(env, &supplied_owned_refs);
+            if let crate::execution_gate::ExternalOutcome::Executed(kind, executed_value) = error {
+                // 副作用已发生(原方法已真实执行)。原方法抛出的 Java 异常按全局引用
+                // 保活交给回调收尾以 Throw() 恢复身份;返回值尽力写回 ABI 寄存器。
+                // 严禁重放。[mixed-lock fixture: one-shot 语义(Already Executed)]
+                let pending = jni_capture_pending_exception_global(env);
+                if let Some(raw) = executed_value {
+                    write_primitive_return_to_context(ctx_ptr, return_type, raw);
+                }
+                crate::execution_gate::mark_external_executed(pending);
+                return crate::execution_gate::error_value(ctx, kind);
+            }
+            return crate::execution_gate::error_value(ctx, error.kind());
+        }
+    };
     delete_owned_jvalue_refs(env, &supplied_owned_refs);
 
     js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig)

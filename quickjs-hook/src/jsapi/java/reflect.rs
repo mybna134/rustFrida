@@ -1662,6 +1662,15 @@ pub(crate) unsafe fn get_class_name_unchecked(env_ptr: u64, cls_ptr: u64) -> Opt
 /// PrettyMethod + SIGSEGV handler) 已到位, WalkStack 碰 hook 帧现在是安全的,
 /// 无需 block/绕行.
 pub(crate) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
+    match crate::execution_gate::with_external_current(|| {
+        Ok(find_class_safe_inner(env, class_name))
+    }) {
+        Ok(cls) => cls,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+unsafe fn find_class_safe_inner(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
     // Clear any stale exception before calling FindClass.
     // ART's FindClass asserts no pending exception — calling it with one → SIGABRT.
     jni_check_exc(env);

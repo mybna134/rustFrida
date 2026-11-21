@@ -313,6 +313,19 @@ unsafe fn enqueue_executor_task(
     param_types: Vec<String>,
     args: Vec<ExecutorArg>,
 ) -> ExecutorResult {
+    match crate::execution_gate::with_external_current(|| {
+        Ok(enqueue_executor_task_inner(kind, param_types, args))
+    }) {
+        Ok(result) => result,
+        Err(error) => Err(format!("cooperative Java executor failed: {:?}", error)),
+    }
+}
+
+unsafe fn enqueue_executor_task_inner(
+    kind: ExecutorTaskKind,
+    param_types: Vec<String>,
+    args: Vec<ExecutorArg>,
+) -> ExecutorResult {
     if EXECUTOR_ABORTING.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Java executor is shutting down".to_string());
     }
