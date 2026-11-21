@@ -4,6 +4,7 @@ mod args;
 mod communication;
 mod http_rpc;
 mod injection;
+mod lifecycle;
 mod logger;
 mod proc_mem;
 mod process;
@@ -50,7 +51,28 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use types::get_string_table_names;
 
-const AGENT_SHUTDOWN_WAIT_SECS: u64 = 1;
+const AGENT_SHUTDOWN_WAIT_SECS: u64 = 5;
+
+fn request_agent_shutdown(session: &Session, injection: &InjectionResult) {
+    if session.shutdown_requested.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // 冻结的后台 agent 必须由框架唤醒后再排空/退出，不能只唤醒 cgroup。
+    if let Some(identity) = injection.loader_identity {
+        if lifecycle::inspect_loader(identity) == lifecycle::LoaderState::Running {
+            if let Err(e) = process::thaw_cgroup_freezer(identity.process.id) {
+                log_warn!("退出前框架解冻失败，将保留无法确认退出的映射: {}", e);
+            }
+        }
+    }
+    if let Some(sender) = session.get_sender() {
+        if let Err(e) = send_command(sender, "shutdown") {
+            log_error!("发送 shutdown 失败: {}", e);
+        } else {
+            log_info!("已发送 shutdown，等待 agent 主动断开连接...");
+        }
+    }
+}
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -88,8 +110,20 @@ fn set_current_thread_name(name: &'static [u8]) {
     }
 }
 
-fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult) {
+fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult, deadline: std::time::Instant) {
     if pid <= 0 || injection.libc_munmap == 0 {
+        return;
+    }
+    let identity = match injection.loader_identity {
+        Some(identity) if identity.process.id == pid => identity,
+        _ => {
+            log_warn!("loader 身份未知，保留映射，不执行远程 munmap");
+            return;
+        }
+    };
+    let state = lifecycle::wait_for_loader_exit(identity, deadline);
+    if state != lifecycle::LoaderState::Exited {
+        log_warn!("loader 未确认退出 ({:?})，保留映射，不执行远程 munmap", state);
         return;
     }
     let mut ranges = Vec::new();
@@ -106,13 +140,18 @@ fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult) {
     if ranges.is_empty() {
         return;
     }
-    if !std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
+    if lifecycle::inspect_loader(identity) != lifecycle::LoaderState::Exited {
         return;
     }
 
     let tid = injection::choose_injection_thread(pid);
     if let Err(e) = attach_to_process(tid) {
         log_warn!("loader 残留清理跳过: attach tid={} 失败: {}", tid, e);
+        return;
+    }
+    if lifecycle::inspect_loader(identity) != lifecycle::LoaderState::Exited {
+        log_warn!("attach 后 loader/目标身份变化，跳过映射回收");
+        let _ = ptrace::detach(Pid::from_raw(tid), None);
         return;
     }
     for (label, base, size) in ranges {
@@ -297,6 +336,11 @@ fn main() {
         }
     }
 
+    // 非交互 attach 也需要在正常控制流中处理退出信号。
+    if args.stay_alive {
+        spawn::register_cleanup_handler();
+    }
+
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
         // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
@@ -362,7 +406,7 @@ fn main() {
     // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
     {
         log_info!("等待 agent 连接... (最长 {}s)", args.connect_timeout);
-        let connected = if args.spawn.is_some() {
+        let connected = if args.spawn.is_some() || args.stay_alive {
             session.wait_connected_with_signal(args.connect_timeout, || spawn::signal_received())
         } else {
             session.wait_connected(args.connect_timeout)
@@ -454,10 +498,12 @@ fn main() {
     }
 
     // 非 spawn 模式: --load-script 在 resume 后加载（进程已在运行）
+    let mut script_load_failed = false;
     if args.spawn.is_none() {
         if let Some(script_path) = &args.load_script {
             if let Err(e) = load_script_file(&session, script_path, false) {
                 log_error!("{}", e);
+                script_load_failed = true;
             }
         }
     }
@@ -465,43 +511,46 @@ fn main() {
     // %reload 用：记住最近一次加载的脚本路径
     let mut last_script_path: Option<String> = args.load_script.clone();
 
-    let mut rl = match Editor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            log_error!("初始化行编辑器失败: {}", e);
-            std::process::exit(1);
-        }
-    };
-    rl.set_helper(Some(CommandCompleter::new()));
-    let _ = rl.load_history(".rustfrida_history");
-    println!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
-
-    // 发送 shutdown 到 agent，随后等待 agent 完整清理并主动关闭 socket
-    let send_shutdown = |s: &Session| {
-        if let Some(sender) = s.get_sender() {
-            s.shutdown_requested.store(true, Ordering::Release);
-            if let Err(e) = send_command(sender, "shutdown") {
-                log_error!("发送 shutdown 失败: {}", e);
-            } else {
-                log_info!("已发送 shutdown，等待 agent 主动断开连接...");
+    let mut rl = if args.stay_alive {
+        log_info!("非交互驻留模式：stdin EOF 不卸载，使用 SIGINT/SIGTERM 停止");
+        None
+    } else {
+        let mut editor = match Editor::new() {
+            Ok(e) => e,
+            Err(e) => {
+                log_error!("初始化行编辑器失败: {}", e);
+                std::process::exit(1);
             }
-        }
+        };
+        editor.set_helper(Some(CommandCompleter::new()));
+        let _ = editor.load_history(".rustfrida_history");
+        println!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
+        Some(editor)
     };
 
     loop {
+        if args.stay_alive && script_load_failed {
+            request_agent_shutdown(&session, &injection);
+            break;
+        }
         // 检测 agent 是否已断连（agent 崩溃或目标进程被杀）
         if session.disconnected.load(Ordering::Acquire) {
             log_error!("Agent 连接已断开，请重新注入");
             break;
         }
 
-        // Spawn 模式：检测是否收到终止信号
-        if args.spawn.is_some() && spawn::signal_received() {
+        // 信号处理函数只设标记，统一在这里请求安全退出。
+        if (args.spawn.is_some() || args.stay_alive) && spawn::signal_received() {
             log_info!("收到终止信号，正在退出...");
-            send_shutdown(&session);
+            request_agent_shutdown(&session, &injection);
             break;
         }
 
+        if args.stay_alive {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+        let rl = rl.as_mut().expect("interactive editor");
         match rl.readline("rustfrida> ") {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -515,7 +564,7 @@ fn main() {
                 }
                 if line == "exit" || line == "quit" {
                     log_info!("退出交互模式");
-                    send_shutdown(&session);
+                    request_agent_shutdown(&session, &injection);
                     break;
                 }
                 if line == "jsrepl" {
@@ -606,7 +655,7 @@ fn main() {
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 log_info!("退出交互模式");
-                send_shutdown(&session);
+                request_agent_shutdown(&session, &injection);
                 break;
             }
             Err(e) => {
@@ -616,13 +665,14 @@ fn main() {
         }
     }
 
-    let _ = rl.save_history(".rustfrida_history");
+    if let Some(ref mut editor) = rl {
+        let _ = editor.save_history(".rustfrida_history");
+    }
 
-    // 等待 agent 完成清理并主动关闭 socket。交互路径不能无限等：
-    // 超时后直接返回，并跳过远端 loader 残留清理，避免打断仍在清理中的 agent。
+    // 同一截止时间覆盖 agent 排空和 loader 退出，超时保留远端映射。
     let start = std::time::Instant::now();
-    let shutdown_deadline = std::time::Duration::from_secs(AGENT_SHUTDOWN_WAIT_SECS);
-    while !session.disconnected.load(Ordering::Acquire) && start.elapsed() < shutdown_deadline {
+    let shutdown_deadline = start + std::time::Duration::from_secs(AGENT_SHUTDOWN_WAIT_SECS);
+    while !session.disconnected.load(Ordering::Acquire) && std::time::Instant::now() < shutdown_deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let total = start.elapsed();
@@ -638,12 +688,15 @@ fn main() {
 
     if agent_disconnected {
         if let Some(pid) = target_pid {
-            cleanup_remote_loader_mappings(pid, &injection);
+            cleanup_remote_loader_mappings(pid, &injection, shutdown_deadline);
         }
     }
 
     // Spawn 模式：agent 完整退出后再还原 Zygote patch，避免两个清理流程交错。
     if args.spawn.is_some() {
         spawn::cleanup_zygote_patches();
+    }
+    if args.stay_alive && script_load_failed {
+        std::process::exit(1);
     }
 }

@@ -87,6 +87,7 @@ pub(crate) struct InjectionResult {
     pub(crate) loader_stack: u64,
     pub(crate) loader_stack_size: u64,
     pub(crate) libc_munmap: u64,
+    pub(crate) loader_identity: Option<crate::lifecycle::LoaderIdentity>,
 }
 
 /// 通过 pidfd_getfd 从目标进程提取文件描述符到 host
@@ -338,7 +339,10 @@ fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
 }
 
 pub(crate) fn choose_injection_thread(pid: i32) -> i32 {
-    crate::process::thaw_cgroup_freezer(pid);
+    if let Err(e) = crate::process::thaw_cgroup_freezer(pid) {
+        log_warn!("选择注入线程前解冻失败: {}", e);
+        return pid; // attach_to_process 会复核并向调用方返回错误。
+    }
     let mut fallback = pid;
     for _ in 0..20 {
         let (tid, score) = choose_injection_thread_once(pid);
@@ -732,20 +736,23 @@ struct CgroupThawGuard {
 }
 
 impl CgroupThawGuard {
-    fn start(pid: i32) -> Self {
-        crate::process::thaw_cgroup_freezer(pid);
+    fn start(pid: i32) -> Result<Self, String> {
+        crate::process::thaw_cgroup_freezer(pid)?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
-                crate::process::thaw_cgroup_freezer(pid);
+                if let Err(e) = crate::process::thaw_cgroup_freezer(pid) {
+                    log_warn!("loader 握手期间框架解冻失败: {}", e);
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        Self {
+        Ok(Self {
             stop,
             handle: Some(handle),
-        }
+        })
     }
 }
 
@@ -961,7 +968,7 @@ fn run_loader_handshake(
     libc_munmap: u64,
 ) -> Result<InjectionResult, String> {
     let deadline = Instant::now() + LOADER_HANDSHAKE_TIMEOUT;
-    let _thaw_guard = CgroupThawGuard::start(target_pid);
+    let _thaw_guard = CgroupThawGuard::start(target_pid)?;
 
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
@@ -973,11 +980,28 @@ fn run_loader_handshake(
     recv_exact_timeout(ctrl_fd, &mut tid_buf, deadline, "读取 loader tid")?;
     let thread_id = i32::from_le_bytes(tid_buf);
     log_verbose!("Loader worker tid: {}", thread_id);
+    let loader_identity = match crate::lifecycle::capture_loader_identity(target_pid, thread_id) {
+        Ok(identity) => Some(identity),
+        Err(e) => {
+            log_warn!("无法核实 loader 线程身份，退出时将跳过映射回收: {}", e);
+            None
+        }
+    };
 
     // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
     //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
     //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
-    let agent_memfd = unsafe { libc::memfd_create(b"wwb_so\0".as_ptr() as _, 0) };
+    // Do not call libc::memfd_create here.  On Android, the libc declaration
+    // can resolve to the compat/32-bit syscall number when this binary is
+    // built for aarch64, which makes the host-side loader fail with ENOSYS on
+    // a 64-bit kernel.  Use the target ABI's syscall constant explicitly.
+    let agent_memfd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create as libc::c_long,
+            b"linkmem\0".as_ptr(),
+            0u64,
+        ) as libc::c_int
+    };
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }
@@ -1078,6 +1102,7 @@ fn run_loader_handshake(
         loader_stack: loader_ctx.loader_stack,
         loader_stack_size: loader_ctx.loader_stack_size,
         libc_munmap,
+        loader_identity,
     })
 }
 

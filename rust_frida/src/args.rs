@@ -85,6 +85,14 @@ pub(crate) struct Args {
     #[arg(short = 'l', long = "load-script", value_name = "FILE")]
     pub(crate) load_script: Option<String>,
 
+    /// Attach 后保持非交互会话，不因 stdin EOF 卸载；用 SIGINT/SIGTERM 停止
+    #[arg(
+        long = "stay-alive",
+        requires = "load_script",
+        conflicts_with_all = ["spawn", "watch_so", "server", "dump_props", "set_prop", "del_prop", "repack_props"]
+    )]
+    pub(crate) stay_alive: bool,
+
     /// 显示详细注入信息（地址、偏移等）
     #[arg(short = 'v', long = "verbose")]
     pub(crate) verbose: bool,

@@ -67,29 +67,76 @@ fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
     None
 }
 
-/// 解冻 cgroup v2 freezer（Android 12+ 会冻结后台进程）
-/// 冻结状态下 ptrace attach 的 SIGSTOP 无法送达，waitpid 会永远阻塞。
-pub(crate) fn thaw_cgroup_freezer(pid: i32) {
-    // cgroup v2 freezer 路径格式：/sys/fs/cgroup/<slice>/uid_<uid>/pid_<pid>/cgroup.freeze
-    let cgroup_path = format!("/proc/{}/cgroup", pid);
-    let content = match std::fs::read_to_string(&cgroup_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    // 解析 cgroup 路径，例如 "0::/system/uid_1000/pid_13323"
+/// 通过 Android 框架解冻，保持 Binder freezer 与 cgroup 状态一致。
+/// 不能直接写 cgroup.freeze，否则 AMS 仍认为进程被冻结，可能因同步 Binder 事务杀进程。
+pub(crate) fn thaw_cgroup_freezer(pid: i32) -> Result<(), String> {
+    if pid <= 0 {
+        return Err("无效的解冻 PID".into());
+    }
+    let content = std::fs::read_to_string(format!("/proc/{}/cgroup", pid))
+        .map_err(|e| format!("读取进程 {} 的 cgroup 失败: {}", pid, e))?;
+    let mut frozen_paths = Vec::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.splitn(3, ':').collect();
-        if parts.len() == 3 {
-            let cgroup_rel = parts[2].trim_start_matches('/');
-            let freeze_path = format!("/sys/fs/cgroup/{}/cgroup.freeze", cgroup_rel);
-            if let Ok(val) = std::fs::read_to_string(&freeze_path) {
-                if val.trim() == "1" {
-                    log_info!("解冻 cgroup freezer: {}", freeze_path);
-                    let _ = std::fs::write(&freeze_path, "0");
-                }
+        if parts.len() != 3 {
+            continue;
+        }
+        let path = format!("/sys/fs/cgroup/{}/cgroup.freeze", parts[2].trim_start_matches('/'));
+        match std::fs::read_to_string(&path) {
+            Ok(value) if value.trim() == "1" => frozen_paths.push(path),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("读取 freezer 状态失败: {}: {}", path, e)),
+        }
+    }
+    if frozen_paths.is_empty() {
+        return Ok(());
+    }
+
+    // attach 的参数可能是线程 TID；ActivityManager 需要所属进程 TGID。
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid))
+        .map_err(|e| format!("读取进程身份失败: {}", e))?;
+    let tgid = status.lines()
+        .find_map(|line| line.strip_prefix("Tgid:").and_then(|v| v.trim().parse::<i32>().ok()))
+        .ok_or_else(|| "无法解析进程 TGID".to_string())?;
+    let identity = crate::lifecycle::capture_loader_identity(tgid, tgid)
+        .map_err(|e| format!("无法核实待解冻进程身份: {}", e))?;
+    log_info!("通过 Android 框架解冻进程 {}（同步 Binder/cgroup）", tgid);
+    let mut child = process::Command::new("/system/bin/cmd")
+        .args(["activity", "unfreeze", &tgid.to_string()])
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("启动框架解冻命令失败: {}；请先将应用置于前台", e))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit)) if exit.success() => break,
+            Ok(Some(exit)) => return Err(format!("框架解冻失败 ({})；不会回退直接写 cgroup.freeze", exit)),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("框架解冻未完成 ({:?})；不会直接写 cgroup.freeze", result));
             }
         }
     }
+    let current = crate::lifecycle::capture_loader_identity(tgid, tgid)
+        .map_err(|e| format!("解冻后进程身份不可用: {}", e))?;
+    if current != identity {
+        return Err("解冻期间目标进程身份变化".into());
+    }
+    for path in frozen_paths {
+        let value = std::fs::read_to_string(&path)
+            .map_err(|e| format!("复核 freezer 状态失败: {}", e))?;
+        if value.trim() != "0" {
+            return Err("框架未能恢复进程运行；请先将应用置于前台".into());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn read_tracer_pid(pid: i32) -> Option<i32> {
@@ -105,8 +152,8 @@ pub(crate) fn read_tracer_pid(pid: i32) -> Option<i32> {
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
 
-    // 解冻 cgroup freezer（Android 12+ 后台进程可能被冻结）
-    thaw_cgroup_freezer(pid);
+    // 必须同步框架和 Binder 状态；失败时不进入可能永久阻塞的 attach。
+    thaw_cgroup_freezer(pid)?;
 
     if let Some(tracer_pid) = read_tracer_pid(pid) {
         if tracer_pid != 0 {
