@@ -21,5 +21,7 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    // Keep the eBPF compiler and bpf-linker on the same LLVM major version.
+    // The host currently provides LLVM 22 through bpf-linker.
+    aya_build::build_ebpf([ebpf_package], Toolchain::Custom("nightly-2026-07-14"))
 }
